@@ -151,6 +151,22 @@ class ACTPolicy(PreTrainedPolicy):
         if len(self._temporal_ensemblers) > batch_size:
             self._temporal_ensemblers = self._temporal_ensemblers[:batch_size]
 
+    def _prepare_inference_batch(self, batch: dict[str, Tensor]) -> tuple[dict[str, Tensor], int]:
+        """Normalize a batch and infer its batch size for policy inference."""
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch["observation.images"] = [batch[key] for key in self.config.image_features]
+
+        batch_size = None
+        for v in batch.values():
+            if isinstance(v, torch.Tensor):
+                batch_size = v.shape[0]
+                break
+        if batch_size is None:
+            raise ValueError("Could not determine batch size from input batch dictionary.")
+        return batch, batch_size
+
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -161,21 +177,7 @@ class ACTPolicy(PreTrainedPolicy):
         """
         self.eval()
 
-        batch = self.normalize_inputs(batch)
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = [batch[key] for key in self.config.image_features]
-
-        # Pick any tensor in the batch dictionary to determine the batch dimension. Some entries
-        # (e.g. "observation.images") are *lists* of tensors, so we skip those.
-        batch_size = None
-        for v in batch.values():
-            if isinstance(v, torch.Tensor):
-                batch_size = v.shape[0]
-                break
-        if batch_size is None:
-            # Should never happen- at least one tensor is expected in every batch.
-            raise ValueError("Could not determine batch size from input batch dictionary.")
+        batch, batch_size = self._prepare_inference_batch(batch)
 
         # ------------------------------------------------------------------
         # Case 1: temporal ensembling (n_action_steps must be 1 in this mode)
@@ -219,6 +221,27 @@ class ACTPolicy(PreTrainedPolicy):
         return torch.stack(actions_to_execute, dim=0)
 
     @torch.no_grad
+    def select_action_chunk(self, batch: dict[str, Tensor], n_steps: int | None = None) -> Tensor:
+        """Select an action chunk directly without touching the internal action queues."""
+        self.eval()
+        if self.config.temporal_ensemble_coeff is not None:
+            raise ValueError("Chunk selection is not supported when temporal ensembling is enabled.")
+
+        batch, _ = self._prepare_inference_batch(batch)
+
+        if n_steps is None:
+            n_steps = self.config.n_action_steps
+        if n_steps <= 0:
+            raise ValueError("n_steps must be positive.")
+        if n_steps > self.config.chunk_size:
+            raise ValueError(
+                f"Requested {n_steps} action steps, but the ACT policy chunk size is only {self.config.chunk_size}."
+            )
+
+        actions_seq = self.model(batch)[0][:, :n_steps]
+        return self.unnormalize_outputs({"action": actions_seq})["action"]
+
+    @torch.no_grad
     def select_action_normalized(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
@@ -229,6 +252,12 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.select_action(batch)
         actions = self.normalize_targets({"action": actions})["action"]
         return actions  # noqa: RET504
+
+    @torch.no_grad
+    def select_action_chunk_normalized(self, batch: dict[str, Tensor], n_steps: int | None = None) -> Tensor:
+        """Select a normalized action chunk directly without using the internal action queues."""
+        actions = self.select_action_chunk(batch, n_steps=n_steps)
+        return self.normalize_targets({"action": actions})["action"]
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""

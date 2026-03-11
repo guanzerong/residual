@@ -6,3 +6,14 @@ offline_buffer_cache/
 online_buffer_cache/
 bc_run_*
 deps/
+chunk_outputs_*/
+MUJOCO_LOG.TXT
+.pytest_cache/
+*.pyc
+*.pyo
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors

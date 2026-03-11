@@ -15,5 +15,5 @@ python -m pip install -e "$DEPS_DIR/lerobot" --no-deps
 
 # Install a couple of dependencies
 python -m pip install -r resfit/lerobot/lerobot_requirements.txt
-python -m pip install --upgrade torch torchvision torchcodec
+python -m pip install --upgrade "torch==2.7.*" torchvision torchcodec --index-url https://download.pytorch.org/whl/cu128
 python -m pip install datasets==3.6.0
