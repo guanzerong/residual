@@ -20,6 +20,9 @@ class VitEncoder(nn.Module):
             embed_norm=cfg.embed_norm,
             num_head=cfg.num_heads,
             depth=cfg.depth,
+            image_size=(obs_shape[1], obs_shape[2]),
+            patch_size=cfg.patch_size,
+            stride=cfg.stride,
         )
 
         self.num_patch = self.vit.num_patches

@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
 
 
 class ResidualChunkVecEnvWrapper:
@@ -22,7 +21,7 @@ class ResidualChunkVecEnvWrapper:
     def __init__(
         self,
         vec_env: VectorizedEnvWrapper,
-        base_policy: ACTPolicy,
+        base_policy,
         action_scaler,
         state_standardizer,
         *,

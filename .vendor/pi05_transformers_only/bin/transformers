@@ -1,0 +1,6 @@
+#!/home/gzr1/miniconda3/envs/residual1/bin/python
+import sys
+from transformers.commands.transformers_cli import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

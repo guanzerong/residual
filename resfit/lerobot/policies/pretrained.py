@@ -25,13 +25,17 @@ import wandb
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
-from lerobot.common.utils.hub import HubMixin
 from safetensors.torch import load_model as load_model_as_safetensor
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 from typing_extensions import Self
 
 from resfit.lerobot.configs.policies import PreTrainedConfig
+
+try:
+    from lerobot.common.utils.hub import HubMixin
+except ImportError:
+    from lerobot.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 

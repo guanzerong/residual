@@ -68,6 +68,38 @@ def _download_from_wandb(checkpoint_spec: str) -> tuple[Path, dict]:
     return checkpoint_path, wandb_config
 
 
+def resolve_checkpoint_path(checkpoint_spec: str | Path) -> tuple[Path, dict | None]:
+    """Resolve a checkpoint spec to a local path.
+
+    Supports either:
+    - A local filesystem path
+    - A W&B file specification in the form
+      ``entity/project/runs/run_id/files/path/to/checkpoint.pt``
+    """
+    checkpoint_path = Path(checkpoint_spec).expanduser()
+    if checkpoint_path.exists():
+        return checkpoint_path.resolve(), None
+
+    checkpoint_spec_str = str(checkpoint_spec)
+    if "/files/" in checkpoint_spec_str and "/runs/" in checkpoint_spec_str:
+        return _download_from_wandb(checkpoint_spec_str)
+
+    raise FileNotFoundError(
+        "Checkpoint not found. Expected either an existing local path or a W&B file spec, "
+        f"got: {checkpoint_spec}"
+    )
+
+
+def load_checkpoint(checkpoint_spec: str | Path, *, map_location: str | torch.device = "cpu") -> dict[str, Any]:
+    """Load a checkpoint payload from disk or W&B."""
+    checkpoint_path, wandb_config = resolve_checkpoint_path(checkpoint_spec)
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    if wandb_config is not None and "config" not in checkpoint:
+        checkpoint["config"] = wandb_config
+    checkpoint.setdefault("_checkpoint_path", str(checkpoint_path))
+    return checkpoint
+
+
 def save_checkpoint(
     agent: QAgent,
     checkpoint_path: str | Path,

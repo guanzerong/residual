@@ -19,21 +19,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.envs.configs import EnvConfig
-from lerobot.common.envs.utils import env_to_policy_features
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pi0fast.configuration_pi0fast import PI0FASTConfig
-from lerobot.common.policies.tdmpc.configuration_tdmpc import TDMPCConfig
-from lerobot.common.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.configs.types import FeatureType
 from torch import nn
 
 from resfit.lerobot.configs.policies import PreTrainedConfig
-from resfit.lerobot.policies.act.configuration_act import ACTConfig
-from resfit.lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+
+try:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.common.datasets.utils import dataset_to_policy_features
+    from lerobot.common.envs.configs import EnvConfig
+    from lerobot.common.envs.utils import env_to_policy_features
+except ImportError:
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.datasets.utils import dataset_to_policy_features
+    from lerobot.envs.configs import EnvConfig
+    from lerobot.envs.utils import env_to_policy_features
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
@@ -66,22 +67,54 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.common.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy
 
         return PI0FASTPolicy
+    if name == "pi05":
+        from resfit.lerobot.policies.pi05.adapter import PI05PolicyAdapter
+
+        return PI05PolicyAdapter
     raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     if policy_type == "tdmpc":
+        try:
+            from lerobot.common.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+        except ImportError:
+            from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+
         return TDMPCConfig(**kwargs)
     if policy_type == "diffusion":
+        from resfit.lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
         return DiffusionConfig(**kwargs)
     if policy_type == "act":
+        from resfit.lerobot.policies.act.configuration_act import ACTConfig
+
         return ACTConfig(**kwargs)
     if policy_type == "vqbet":
+        try:
+            from lerobot.common.policies.vqbet.configuration_vqbet import VQBeTConfig
+        except ImportError:
+            from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+
         return VQBeTConfig(**kwargs)
     if policy_type == "pi0":
+        try:
+            from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
+        except ImportError:
+            from lerobot.policies.pi0.configuration_pi0 import PI0Config
+
         return PI0Config(**kwargs)
     if policy_type == "pi0fast":
+        try:
+            from lerobot.common.policies.pi0fast.configuration_pi0fast import PI0FASTConfig
+        except ImportError:
+            from lerobot.policies.pi0fast.configuration_pi0fast import PI0FASTConfig
+
         return PI0FASTConfig(**kwargs)
+    if policy_type == "pi05":
+        from resfit.lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+        return PI05Config(**kwargs)
     raise ValueError(f"Policy type '{policy_type}' is not available.")
 
 
@@ -89,6 +122,7 @@ def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
+    **extra_kwargs,
 ) -> PreTrainedPolicy:
     """Make an instance of a policy class.
 
@@ -143,6 +177,7 @@ def make_policy(
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     kwargs["config"] = cfg
+    kwargs.update(extra_kwargs)
 
     if cfg.pretrained_path:
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time

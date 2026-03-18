@@ -62,6 +62,22 @@ Verify CUDA is enabled:
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
+#### 5. Optional: Add DINOv2 and VGGT Source Trees
+
+If you want to integrate ConsisVLA-style visual backbones inside this repo,
+keep both repositories under `third_party/` and reuse the existing
+`residual1` environment:
+
+```bash
+conda activate residual1
+bash scripts/setup_consisvla_backbones.sh
+scripts/run_with_consisvla_backbones.sh python -c "from dinov2.hub.backbones import dinov2_vitl14_reg; from vggt.models.vggt import VGGT; print('ok')"
+```
+
+This path intentionally avoids installing DINOv2's pinned `torch==2.0.0` and
+`xformers==0.0.18`, which would conflict with the current CUDA 12.8 / LeRobot
+stack used by this project.
+
 ## Launch training
 
 ### BC policy training

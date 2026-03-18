@@ -15,6 +15,8 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgo
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
     num_episodes: int | None = 300
+    episode_start: int = 0
+    dataset_schema: str = "resfit"
     # Offline data action labeling options
     use_base_policy_for_base_actions: bool = True
     # Normalization safeguards
@@ -35,9 +37,16 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
+    source: str = "wandb"
     wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
+    local_path: str | None = None
+    openpi_host: str = "127.0.0.1"
+    openpi_port: int = 8000
+    openpi_chunk_size: int = 20
+    openpi_api_key: str | None = None
+    task_prompt: str | None = None
 
 
 @dataclass
@@ -79,6 +88,8 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
 @dataclass
 class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     actor_name: str | None = None  # Inferred from base policy config
+    env_camera_size: int = 84
+    env_state_encoding: str = "quat"
 
     # ------------------------------------------------------------------
     # Algorithm & optimisation

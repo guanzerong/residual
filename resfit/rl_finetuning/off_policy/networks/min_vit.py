@@ -10,37 +10,54 @@ from torch.nn.init import trunc_normal_
 
 
 class PatchEmbed1(nn.Module):
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, patch_size=8, stride=-1):
         super().__init__()
-        self.conv = nn.Conv2d(3, embed_dim, kernel_size=8, stride=8)
+        if stride <= 0:
+            stride = patch_size
+        self.conv = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=stride)
 
-        self.num_patch = 144  # if input image is 96x96, then num_patch = 144
         self.patch_dim = embed_dim
 
-    def forward(self, x: torch.Tensor):
+    def get_output_grid_size(self, image_size: tuple[int, int]) -> tuple[int, int]:
+        with torch.no_grad():
+            y = self.conv(torch.zeros(1, 3, *image_size))
+        return int(y.shape[-2]), int(y.shape[-1])
+
+    def forward(self, x: torch.Tensor, return_grid_size: bool = False):
         y = self.conv(x)
+        grid_size = (int(y.shape[-2]), int(y.shape[-1]))
         y = einops.rearrange(y, "b c h w -> b (h  w) c")
+        if return_grid_size:
+            return y, grid_size
         return y  # noqa: RET504
 
 
 class PatchEmbed2(nn.Module):
-    def __init__(self, embed_dim, use_norm):
+    def __init__(self, embed_dim, use_norm, patch_size=8, stride=-1):
         super().__init__()
+        if stride <= 0:
+            stride = max(1, patch_size // 2)
         layers = [
-            nn.Conv2d(3, embed_dim, kernel_size=8, stride=4),
+            nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=stride),
             nn.GroupNorm(embed_dim, embed_dim) if use_norm else nn.Identity(),
             nn.ReLU(),
             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2),
         ]
         self.embed = nn.Sequential(*layers)
 
-        # self.num_patch = 121  # if input image is 96x96, then num_patch = 121
-        self.num_patch = 81  # if input image is 84x84, then num_patch = 81
         self.patch_dim = embed_dim
 
-    def forward(self, x: torch.Tensor):
+    def get_output_grid_size(self, image_size: tuple[int, int]) -> tuple[int, int]:
+        with torch.no_grad():
+            y = self.embed(torch.zeros(1, 3, *image_size))
+        return int(y.shape[-2]), int(y.shape[-1])
+
+    def forward(self, x: torch.Tensor, return_grid_size: bool = False):
         y = self.embed(x)
+        grid_size = (int(y.shape[-2]), int(y.shape[-1]))
         y = einops.rearrange(y, "b c h w -> b (h  w) c")
+        if return_grid_size:
+            return y, grid_size
         return y  # noqa: RET504
 
 
@@ -89,31 +106,48 @@ class TransformerLayer(nn.Module):
 
 
 class MinVit(nn.Module):
-    def __init__(self, embed_style, embed_dim, embed_norm, num_head, depth):
+    def __init__(self, embed_style, embed_dim, embed_norm, num_head, depth, image_size, patch_size=8, stride=-1):
         super().__init__()
 
         if embed_style == "embed1":
-            raise NotImplementedError("embed1 is not tested")
-            # self.patch_embed = PatchEmbed1(embed_dim)
-        if embed_style == "embed2":
-            self.patch_embed = PatchEmbed2(embed_dim, use_norm=embed_norm)
+            self.patch_embed = PatchEmbed1(embed_dim, patch_size=patch_size, stride=stride)
+        elif embed_style == "embed2":
+            self.patch_embed = PatchEmbed2(embed_dim, use_norm=embed_norm, patch_size=patch_size, stride=stride)
         else:
             raise NotImplementedError(f"Unknown embed style {embed_style}")
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patch, embed_dim))
+        self.base_grid_size = self.patch_embed.get_output_grid_size(image_size)
+        self.num_patches = self.base_grid_size[0] * self.base_grid_size[1]
+        # Keep the old attribute name for compatibility with callers that inspect the patch embed.
+        self.patch_embed.num_patch = self.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         layers = [TransformerLayer(embed_dim, num_head, 0) for _ in range(depth)]
 
         self.net = nn.Sequential(*layers)
         self.norm = nn.LayerNorm(embed_dim)
-        self.num_patches = self.patch_embed.num_patch
 
         # weight init
         trunc_normal_(self.pos_embed, std=0.02)
         named_apply(init_weights_vit_timm, self)
 
+    def _resize_pos_embed(self, grid_size: tuple[int, int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if grid_size == self.base_grid_size:
+            return self.pos_embed.to(device=device, dtype=dtype)
+
+        pos_embed = self.pos_embed.reshape(1, self.base_grid_size[0], self.base_grid_size[1], -1)
+        pos_embed = pos_embed.permute(0, 3, 1, 2)
+        pos_embed = torch.nn.functional.interpolate(
+            pos_embed,
+            size=grid_size,
+            mode="bicubic",
+            align_corners=False,
+        )
+        pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, grid_size[0] * grid_size[1], -1)
+        return pos_embed.to(device=device, dtype=dtype)
+
     def forward(self, x):
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
+        x, grid_size = self.patch_embed(x, return_grid_size=True)
+        x = x + self._resize_pos_embed(grid_size, dtype=x.dtype, device=x.device)
         x = self.net(x)
         return self.norm(x)
 

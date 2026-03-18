@@ -19,8 +19,7 @@ import robosuite  # noqa: E402
 import torch  # noqa: E402
 from robosuite import load_composite_controller_config, macros  # noqa: E402
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv  # noqa: E402
-
-macros.IMAGE_CONVENTION = "opencv"
+from robosuite.utils import transform_utils as T  # noqa: E402
 
 
 # Mapping from (canonical) environment name to the corresponding list of robot models
@@ -90,6 +89,7 @@ class RobosuiteGymWrapper:
         camera_size: int = 84,
         render_size: tuple[int, int] | int | None = None,
         env_id: int = 0,
+        state_encoding: str = "quat",
     ):
         # ------------------------------------------------------------------
         # Allow common aliases used in the Robomimic literature.
@@ -114,6 +114,7 @@ class RobosuiteGymWrapper:
         self.num_envs = num_envs
         self.render_gpu_device_id = render_gpu_device_id
         self.camera_size = camera_size
+        self.state_encoding = state_encoding
         # Convert render_size to tuple if it's an int, or use default (240, 320)
         if render_size is None:
             self.render_size = (240, 320)
@@ -151,6 +152,9 @@ class RobosuiteGymWrapper:
         self.video_key = None
 
         self.episode_steps = 0
+
+        if self.state_encoding not in {"quat", "axis_angle"}:
+            raise ValueError(f"Unsupported state_encoding={self.state_encoding!r}. Expected 'quat' or 'axis_angle'.")
 
         if env_name not in ENV_ROBOTS:
             raise ValueError(f"Unknown robosuite environment: {env_name}")
@@ -209,7 +213,12 @@ class RobosuiteGymWrapper:
             env_kwargs["env_configuration"] = "opposed"
             env_kwargs["controller_configs"]["body_parts"]["right"]["input_ref_frame"] = "world"
 
-        self.env: ManipulationEnv = robosuite.make(**env_kwargs)
+        prev_image_convention = macros.IMAGE_CONVENTION
+        macros.IMAGE_CONVENTION = "opencv"
+        try:
+            self.env: ManipulationEnv = robosuite.make(**env_kwargs)
+        finally:
+            macros.IMAGE_CONVENTION = prev_image_convention
 
         logger.debug(
             f"Successfully created {env_name} environment via robosuite.make() "
@@ -249,21 +258,9 @@ class RobosuiteGymWrapper:
     def _process_obs_for_space_inference(self, obs):
         """Process observations for space inference without storing _last_obs."""
         processed_obs = {}
-
-        # Extract robot state
-        expected_low_dim_keys = self._get_expected_low_dim_keys(self.env_name)
-        state_components = []
-
-        for key in expected_low_dim_keys:
-            if key in obs:
-                obs_data = obs[key]
-                if obs_data.ndim == 0:  # scalar
-                    obs_data = np.array([obs_data])
-                state_components.append(obs_data)
-
-        if state_components:
-            concatenated_state = np.concatenate(state_components)
-            processed_obs["observation.state"] = concatenated_state.astype(np.float32)
+        concatenated_state = self._extract_state(obs)
+        if concatenated_state is not None:
+            processed_obs["observation.state"] = concatenated_state
 
         # Extract camera observations
         for img_key in self.expected_image_keys:
@@ -299,8 +296,12 @@ class RobosuiteGymWrapper:
     def step(self, action):
         """Step the environment with the given action."""
         # Convert action from torch tensor to numpy if needed
-        if hasattr(action, "cpu"):
-            action = action.cpu().numpy()
+        if isinstance(action, torch.Tensor):
+            action = action.detach().to(device="cpu", dtype=torch.float32).numpy()
+        elif isinstance(action, np.ndarray):
+            action = action.astype(np.float32, copy=False)
+        else:
+            action = np.asarray(action, dtype=np.float32)
         if action.ndim > 1:
             action = action[0]  # Take first action if batched
 
@@ -330,26 +331,9 @@ class RobosuiteGymWrapper:
     def _process_obs(self, obs):
         """Process robosuite observations to match expected format."""
         processed_obs = {}
-
-        # Extract robot state using the same features as dataset conversion
-        state_components = []
-
-        # Get expected low_dim_keys for this environment (same as dataset conversion)
-        expected_low_dim_keys = self._get_expected_low_dim_keys(self.env_name)
-
-        for key in expected_low_dim_keys:
-            if key in obs:
-                obs_data = obs[key]
-                if obs_data.ndim == 0:  # scalar
-                    obs_data = np.array([obs_data])
-                state_components.append(obs_data)
-            else:
-                logger.debug(f"Expected state key '{key}' not found in environment observations")
-
-        if state_components:
-            concatenated_state = np.concatenate(state_components)
-            # Return numpy array - Gymnasium will handle device placement and batching
-            processed_obs["observation.state"] = concatenated_state.astype(np.float32)
+        concatenated_state = self._extract_state(obs)
+        if concatenated_state is not None:
+            processed_obs["observation.state"] = concatenated_state
 
         # Extract camera observations using the same logic as dataset conversion
         for img_key in self.expected_image_keys:
@@ -378,6 +362,30 @@ class RobosuiteGymWrapper:
             self._logged_obs_keys = True
 
         return processed_obs
+
+    def _extract_state(self, obs) -> np.ndarray | None:
+        """Assemble the low-dimensional observation using the configured state encoding."""
+        expected_low_dim_keys = self._get_expected_low_dim_keys(self.env_name)
+        state_components = []
+
+        for key in expected_low_dim_keys:
+            if key not in obs:
+                logger.debug(f"Expected state key '{key}' not found in environment observations")
+                continue
+
+            obs_data = np.asarray(obs[key], dtype=np.float32)
+            if obs_data.ndim == 0:
+                obs_data = np.array([obs_data], dtype=np.float32)
+
+            if self.state_encoding == "axis_angle" and key.endswith("_eef_quat"):
+                obs_data = T.quat2axisangle(obs_data.astype(np.float32, copy=True)).astype(np.float32, copy=False)
+
+            state_components.append(obs_data)
+
+        if not state_components:
+            return None
+
+        return np.concatenate(state_components).astype(np.float32, copy=False)
 
     def _get_expected_image_keys(self, env_name: str):
         """Return the expected image keys for a given environment.
@@ -543,6 +551,7 @@ def make_dexmimicgen_env(
     render_size: tuple[int, int] | int | None = None,
     render_gpu_device_id: int = 0,
     env_id: int = 0,
+    state_encoding: str = "quat",
 ):
     """Factory function to create a DexMimicGen environment for vectorization."""
 
@@ -554,6 +563,7 @@ def make_dexmimicgen_env(
             camera_size=camera_size,
             render_size=render_size,
             env_id=env_id,
+            state_encoding=state_encoding,
         )
 
     return _make
@@ -576,7 +586,18 @@ class VectorizedEnvWrapper:
         obs = self._convert_obs_to_torch(obs, self.device)
         return obs, info
 
+    @staticmethod
+    def _convert_actions_to_numpy(actions):
+        """Normalize batched actions before sending them to vectorized workers."""
+        if isinstance(actions, torch.Tensor):
+            # Avoid passing CUDA / reduced-precision tensors through multiprocessing pipes.
+            return actions.detach().to(device="cpu", dtype=torch.float32).numpy()
+        if isinstance(actions, np.ndarray):
+            return actions.astype(np.float32, copy=False)
+        return np.asarray(actions, dtype=np.float32)
+
     def step(self, actions):
+        actions = self._convert_actions_to_numpy(actions)
         obs, rewards, terminated, truncated, info = self.vec_env.step(actions)
         self._last_obs = obs
 
@@ -629,6 +650,7 @@ def create_vectorized_env(
     render_size: tuple[int, int] | int | None = None,
     debug: bool = False,
     video_key: str = "observation.images.agentview",
+    state_encoding: str = "quat",
 ) -> VectorizedEnvWrapper:
     """Create vectorized environment using Gymnasium's vector environments."""
 
@@ -652,7 +674,16 @@ def create_vectorized_env(
             render_gpu_device_id = visible_device_ids[env_id % num_visible_gpus]
         else:
             render_gpu_device_id = visible_device_ids[0] if visible_device_ids else 0
-        env_fns.append(make_dexmimicgen_env(env_name, camera_size, render_size, render_gpu_device_id, env_id))
+        env_fns.append(
+            make_dexmimicgen_env(
+                env_name,
+                camera_size,
+                render_size,
+                render_gpu_device_id,
+                env_id,
+                state_encoding,
+            )
+        )
 
     if debug:
         # Use synchronous vectorized environment for debugging
@@ -683,6 +714,7 @@ def create_vectorized_env(
     wrapped_env.env_name = env_name
     wrapped_env.camera_size = camera_size
     wrapped_env.render_size = render_size
+    wrapped_env.state_encoding = state_encoding
 
     logger.debug(f"Created {num_envs} vectorized {env_name} environments")
     logger.debug(f"Set video key to '{video_key}' for video recording")

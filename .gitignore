@@ -6,6 +6,8 @@ offline_buffer_cache/
 online_buffer_cache/
 bc_run_*
 deps/
+third_party/*
+!third_party/README.md
 chunk_outputs_*/
 MUJOCO_LOG.TXT
 .pytest_cache/

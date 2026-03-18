@@ -45,11 +45,6 @@ from typing import Any
 import imageio
 import numpy as np
 import torch
-from lerobot.common.datasets.factory import resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.utils.random_utils import set_seed
 from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
@@ -57,7 +52,21 @@ import wandb
 from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper, create_vectorized_env
 from resfit.lerobot.policies.factory import make_policy, make_policy_config
 from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+from resfit.lerobot.utils.task_prompts import infer_task_prompt
 from resfit.lerobot.utils.load_policy import load_checkpoint, save_checkpoint
+
+try:
+    from lerobot.common.datasets.factory import resolve_delta_timestamps
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
+    from lerobot.common.datasets.utils import cycle
+    from lerobot.common.utils.random_utils import set_seed
+except ImportError:
+    from lerobot.datasets.factory import resolve_delta_timestamps
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+    from lerobot.datasets.utils import cycle
+    from lerobot.utils.random_utils import set_seed
 
 # Set multiprocessing start method for CUDA compatibility
 # This must be done before any other multiprocessing operations
@@ -92,6 +101,7 @@ parser.add_argument(
         "latent_act",
         "pi0",
         "pi0fast",
+        "pi05",
         "tdmpc",
         "vqbet",
     ],
@@ -125,6 +135,15 @@ parser.add_argument(
     type=str,
     default=None,
     help="WandB run ID to resume from (grabs the 'latest' artifact to restore trainer state).",
+)
+parser.add_argument(
+    "--init_policy",
+    type=str,
+    default=None,
+    help=(
+        "Optional pretrained policy repo or local directory to initialize model weights from "
+        "(for example `lerobot/pi05_base`). Unlike --resume_ckpt, this does not restore optimizer state."
+    ),
 )
 
 # ------------------------------------------------------------------
@@ -212,6 +231,12 @@ parser.add_argument(
         "Disable proprioceptive observations (observation.state) during training. "
         "Only visual observations will be used."
     ),
+)
+parser.add_argument(
+    "--task_prompt",
+    type=str,
+    default=None,
+    help="Optional text prompt to inject for language-conditioned policies such as pi05.",
 )
 
 args_cli = parser.parse_args()
@@ -428,6 +453,11 @@ def main(cfg: argparse.Namespace):
     # ---------------------------------------------------------------------
     logger.info("Fetching dataset metadata from the Hub…")
     ds_meta = LeRobotDatasetMetadata(cfg.dataset)
+    default_task = infer_task_prompt(
+        dataset_name=cfg.dataset,
+        task_name=cfg.eval_env,
+        explicit_prompt=cfg.task_prompt,
+    )
 
     # ---------------------------------------------------------------------
     # Build the policy configuration, applying any CLI-specified overrides
@@ -465,6 +495,7 @@ def main(cfg: argparse.Namespace):
                 policy_kwargs[k] = _infer_type(v)
     else:
         policy_kwargs = {}
+    explicit_policy_override_keys = set(policy_kwargs.keys())
 
     # Build the policy config and set the target device.  When resuming from
     # checkpoints the device string can include an explicit index (e.g.
@@ -474,9 +505,20 @@ def main(cfg: argparse.Namespace):
 
     policy_cfg = make_policy_config(cfg.policy, **policy_kwargs)
 
-    # Set the chunk size to 20 (env is at 20 fps)
-    policy_cfg.chunk_size = 20
-    policy_cfg.n_action_steps = 20
+    # Most DexMG policies in this repo use a 20-step action horizon.
+    # For pretrained pi05, preserve the checkpoint's native chunk horizon
+    # unless the user explicitly overrides it through --policy_kwargs.
+    preserve_pretrained_pi05_chunk = (
+        cfg.policy == "pi05"
+        and cfg.init_policy is not None
+        and "chunk_size" not in explicit_policy_override_keys
+        and "n_action_steps" not in explicit_policy_override_keys
+    )
+    if preserve_pretrained_pi05_chunk:
+        logger.info("Preserving pretrained pi05 chunk_size/n_action_steps from the checkpoint config.")
+    else:
+        policy_cfg.chunk_size = 20
+        policy_cfg.n_action_steps = 20
 
     if isinstance(cfg.device, str):
         # e.g. "cuda:0" -> "cuda"
@@ -484,6 +526,9 @@ def main(cfg: argparse.Namespace):
     else:
         # Fall back to original value if somehow not a string
         policy_cfg.device = cfg.device
+
+    if cfg.init_policy:
+        policy_cfg.pretrained_path = cfg.init_policy
 
     # Filter dataset features based on selected cameras if specified
     if cfg.policy_cameras is not None:
@@ -568,17 +613,37 @@ def main(cfg: argparse.Namespace):
     # ---------------------------------------------------------------------
     # Policy + optimizer
     # ---------------------------------------------------------------------
-    policy = make_policy(policy_cfg, ds_meta=ds_meta)
+    policy_extra_kwargs: dict[str, Any] = {}
+    if cfg.policy == "pi05":
+        policy_extra_kwargs["default_task"] = default_task
+
+    if cfg.init_policy is not None:
+        logger.info(f"Initializing {cfg.policy} policy from pretrained checkpoint: {cfg.init_policy}")
+    else:
+        logger.info(f"Initializing {cfg.policy} policy from scratch")
+    policy = make_policy(policy_cfg, ds_meta=ds_meta, **policy_extra_kwargs)
+    logger.info("Policy initialization complete")
     policy.train()
 
     # Print the policy config
-    print(policy_cfg)
+    print(policy.config)
 
     # Learning-rate & weight-decay fallbacks
-    lr_default = getattr(policy_cfg, "optimizer_lr", 1e-4)
-    wd_default = getattr(policy_cfg, "optimizer_weight_decay", 0.0)
+    effective_policy_cfg = policy.config
+    lr_default = getattr(effective_policy_cfg, "optimizer_lr", 1e-4)
+    wd_default = getattr(effective_policy_cfg, "optimizer_weight_decay", 0.0)
 
     optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=lr_default, weight_decay=wd_default)
+    scheduler_cfg = effective_policy_cfg.get_scheduler_preset()
+    lr_scheduler = scheduler_cfg.build(optimizer, cfg.steps) if scheduler_cfg is not None else None
+    if lr_scheduler is not None:
+        logger.info(f"LR scheduler enabled: {scheduler_cfg.type}")
+
+    amp_enabled = bool(getattr(effective_policy_cfg, "use_amp", False) and device.type == "cuda")
+    amp_dtype = torch.bfloat16 if getattr(effective_policy_cfg, "dtype", None) == "bfloat16" else torch.float16
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
+    if amp_enabled:
+        logger.info(f"AMP enabled with dtype={amp_dtype}")
 
     # ---------------------------------------------------------------------
     # Optional WandB
@@ -629,6 +694,7 @@ def main(cfg: argparse.Namespace):
             resume="must" if wandb_run_id else None,
         )
         logger.info(colored("W&B logging enabled", "blue"))
+    wandb_active = bool(cfg.wandb_enable and getattr(wandb, "run", None) is not None)
 
     # ---------------------------------------------------------------------
     # Optionally resume from checkpoint (local folder or WandB artifact)
@@ -645,11 +711,27 @@ def main(cfg: argparse.Namespace):
         artifact = api.artifact(artifact_path)
         artifact_dir = Path(artifact.download())
 
-        start_step, policy, optimizer = load_checkpoint(artifact_dir, policy, optimizer)
+        checkpoint_kwargs = {}
+        if cfg.policy == "pi05":
+            checkpoint_kwargs = {
+                "dataset_stats": ds_meta.stats,
+                "default_task": default_task,
+            }
+        start_step, policy, optimizer, lr_scheduler = load_checkpoint(
+            artifact_dir, policy, optimizer, lr_scheduler, **checkpoint_kwargs
+        )
         policy.to(device)
     elif cfg.resume_ckpt is not None:
         logger.info(colored(f"Resuming from local checkpoint {cfg.resume_ckpt}", "cyan"))
-        start_step, policy, optimizer = load_checkpoint(Path(cfg.resume_ckpt), policy, optimizer)
+        checkpoint_kwargs = {}
+        if cfg.policy == "pi05":
+            checkpoint_kwargs = {
+                "dataset_stats": ds_meta.stats,
+                "default_task": default_task,
+            }
+        start_step, policy, optimizer, lr_scheduler = load_checkpoint(
+            Path(cfg.resume_ckpt), policy, optimizer, lr_scheduler, **checkpoint_kwargs
+        )
         policy.to(device)
 
     # ---------------------------------------------------------------------
@@ -746,11 +828,21 @@ def main(cfg: argparse.Namespace):
         # ------------------------------------------------------------------
         update_t0 = time.perf_counter()
 
-        loss, _ = policy.forward(batch)
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.grad_clip_norm)
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            loss, _ = policy.forward(batch)
+        if grad_scaler.is_enabled():
+            grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.grad_clip_norm)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.grad_clip_norm)
+            optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
         update_ms = (time.perf_counter() - update_t0) * 1000
@@ -763,18 +855,21 @@ def main(cfg: argparse.Namespace):
         loss_val = loss.item()
 
         if step % cfg.log_freq == 0:
+            current_lr = optimizer.param_groups[0]["lr"]
             msg = (
                 f"[step {step:>6d}/{cfg.steps}]"
                 f" loss: {loss_val:.4f}"
+                f" | lr: {current_lr:.2e}"
                 f" | data: {data_load_ms:.1f} ms"
                 f" | update: {update_ms:.1f} ms"
                 f" | iter: {iter_ms:.1f} ms"
             )
             logger.info(msg)
-            if wandb is not None:
+            if wandb_active:
                 wandb.log(
                     {
                         "train/loss": loss_val,
+                        "train/lr": current_lr,
                         "time/data_load_ms": data_load_ms,
                         "time/update_ms": update_ms,
                         "time/iter_ms": iter_ms,
@@ -795,7 +890,7 @@ def main(cfg: argparse.Namespace):
             if latest_dir.exists():
                 # Remove previous to avoid stale files
                 shutil.rmtree(latest_dir)
-            save_checkpoint(latest_dir, step, policy, optimizer)
+            save_checkpoint(latest_dir, step, policy, optimizer, lr_scheduler)
 
             logger.info(
                 colored(
@@ -804,7 +899,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if wandb_active:
                 # Log model-only artifact (no optimizer)
                 art_model = wandb.Artifact(name=f"run_{wandb.run.id}_model_step_{step}", type="model")
                 art_model.add_dir(str(model_dir))
@@ -847,7 +942,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if wandb_active:
                 wandb.log(
                     {
                         "eval/success_rate": success_rate,
@@ -876,16 +971,16 @@ def main(cfg: argparse.Namespace):
                 best_dir = output_dir / "best"
                 if best_dir.exists():
                     shutil.rmtree(best_dir)
-                save_checkpoint(best_dir, step, policy, optimizer)
+                save_checkpoint(best_dir, step, policy, optimizer, lr_scheduler)
 
-                if wandb is not None:
+                if wandb_active:
                     # Overwrite/refresh the "best" artifact so that the most recent best checkpoint is easy to retrieve
                     art_best = wandb.Artifact(name=f"run_{wandb.run.id}_best", type="model")
                     art_best.add_dir(str(best_dir))
                     wandb.log_artifact(art_best, aliases=["best", "latest"])
 
     logger.info(colored("Training finished!", "green", attrs=["bold"]))
-    if wandb is not None:
+    if wandb_active:
         wandb.finish()
 
     if eval_env is not None:
