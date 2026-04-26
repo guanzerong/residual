@@ -23,6 +23,73 @@ class VitEncoderConfig:
 
 
 @dataclass
+class DepthAnythingV2ConditioningConfig:
+    enabled: bool = False
+    encoder: str = "vits"
+    source_root: str | None = None
+    weights: str | None = None
+    freeze_encoder: bool = True
+    num_intermediate_layers: int = 1
+    feature_layer: int = -1
+    # 0 means "condition every MinViT block".
+    num_conditioned_layers: int = 0
+    # Keep 0 to reuse the RL image resolution as-is.
+    resize_to: int = 0
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+    def __post_init__(self):
+        assert self.encoder in ["vits", "vitb", "vitl"], f"Unknown DepthAnythingV2 encoder {self.encoder!r}"
+        assert self.num_intermediate_layers >= 1, "num_intermediate_layers must be >= 1"
+        assert self.num_conditioned_layers >= 0, "num_conditioned_layers must be >= 0"
+        assert self.resize_to >= 0, "resize_to must be >= 0"
+
+
+@dataclass
+class DepthAnythingV2PatchStateConfig:
+    enabled: bool = False
+    encoder: str = "vits"
+    source_root: str | None = None
+    weights: str | None = None
+    freeze_encoder: bool = True
+    num_intermediate_layers: int = 1
+    feature_layer: int = -1
+    resize_to: int = 0
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    camera_keys: tuple[str, ...] = ()
+    # "trajectory" selects local tokens along the base action trajectory.
+    # "all" uses a uniform/global set of patch tokens from the full image.
+    selection_mode: str = "trajectory"
+    max_patches_per_camera: int = 0
+    # A learnable scalar gate on projected local-depth patch tokens. Setting
+    # this below 1.0 lets depth start as an auxiliary signal instead of
+    # immediately dominating the residual policy.
+    token_scale_init: float = 1.0
+    # Linearly ramp the depth token gate over critic updates. This keeps the
+    # initial policy close to the ACT-only baseline and lets depth become useful
+    # after the critic has a stable value fit.
+    token_scale_warmup_steps: int = 0
+    # Zero-initialize the local-depth projector so enabling depth does not inject
+    # random features into the actor / critic at step 0.
+    zero_init_projector: bool = False
+    # Drop selected local-depth tokens during training to reduce reliance on
+    # occasional noisy projected patches. Valid tokens are rescaled by
+    # 1 / (1 - token_dropout) after dropout.
+    token_dropout: float = 0.0
+
+    def __post_init__(self):
+        assert self.encoder in ["vits", "vitb", "vitl"], f"Unknown DepthAnythingV2 encoder {self.encoder!r}"
+        assert self.num_intermediate_layers >= 1, "num_intermediate_layers must be >= 1"
+        assert self.resize_to >= 0, "resize_to must be >= 0"
+        assert self.selection_mode in ["trajectory", "all"], "selection_mode must be 'trajectory' or 'all'"
+        assert self.max_patches_per_camera >= 0, "max_patches_per_camera must be >= 0"
+        assert self.token_scale_init >= 0.0, "token_scale_init must be >= 0"
+        assert self.token_scale_warmup_steps >= 0, "token_scale_warmup_steps must be >= 0"
+        assert 0.0 <= self.token_dropout < 1.0, "token_dropout must be in [0, 1)"
+
+
+@dataclass
 class CriticLossCfg:
     type: str = "mse"
     n_bins: int = 51  # 0.995 γ → δ=0.005  # noqa: RUF003
@@ -106,7 +173,17 @@ class QAgentConfig:
     # encoder
     use_prop: int = 1
     enc_type: str = "vit"
+    # When false, the residual agent does not run its own image encoder.
+    use_residual_image_encoder: bool = True
+    # Reuse the frozen base ACT policy's transformer encoder tokens as residual state tokens.
+    use_base_act_encoder_state: bool = False
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
+    depth_anything_v2_conditioning: DepthAnythingV2ConditioningConfig = field(
+        default_factory=lambda: DepthAnythingV2ConditioningConfig()
+    )
+    depth_anything_v2_patch_state: DepthAnythingV2PatchStateConfig = field(
+        default_factory=lambda: DepthAnythingV2PatchStateConfig()
+    )
     # critic & actor
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
@@ -120,6 +197,11 @@ class QAgentConfig:
     bc_loss_dynamic: int = 0  # dynamically scale bc loss weight
     bc_backprop_encoder: bool = False  # Whether BC loss should update encoder (default False for RLPD)
 
+    # Residual trust-region penalty for actor updates. This keeps depth features
+    # from pushing the residual policy too far away from the strong base policy.
+    residual_l1_penalty_coef: float = 0.0
+    residual_l1_penalty_target: float = 0.065
+
     # encoder freezing
     freeze_encoder: bool = False  # Whether to freeze encoder parameters (no gradient updates)
 
@@ -129,7 +211,8 @@ class QAgentConfig:
     target_action_noise: bool = True  # Whether to add noise to target actions in TD3
 
     def __post_init__(self):
-        pass
+        assert self.residual_l1_penalty_coef >= 0.0, "residual_l1_penalty_coef must be >= 0"
+        assert self.residual_l1_penalty_target >= 0.0, "residual_l1_penalty_target must be >= 0"
 
 
 # -----------------------------------------------------------------------------

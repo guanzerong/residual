@@ -90,6 +90,7 @@ class RobosuiteGymWrapper:
         camera_size: int = 84,
         render_size: tuple[int, int] | int | None = None,
         env_id: int = 0,
+        camera_names: list[str] | None = None,
     ):
         # ------------------------------------------------------------------
         # Allow common aliases used in the Robomimic literature.
@@ -170,10 +171,11 @@ class RobosuiteGymWrapper:
 
         robots = ENV_ROBOTS[env_name]
 
-        # Get expected image keys for this environment (same as dataset conversion)
-        expected_image_keys = self._get_expected_image_keys(env_name)
+        # Get expected image keys for this environment. When training filters
+        # cameras explicitly, mirror that selection during rollout evaluation.
+        expected_image_keys = self._normalize_camera_names(camera_names) or self._get_expected_image_keys(env_name)
         # Remove '_image' suffix to get camera names for robosuite
-        camera_names = [key.replace("_image", "") for key in expected_image_keys]
+        robosuite_camera_names = [key.replace("_image", "") for key in expected_image_keys]
 
         self.expected_image_keys = expected_image_keys  # Store for use in _process_obs
 
@@ -187,7 +189,7 @@ class RobosuiteGymWrapper:
             "ignore_done": False,
             "use_camera_obs": True,
             "control_freq": 20,
-            "camera_names": camera_names,
+            "camera_names": robosuite_camera_names,
             "camera_heights": self.camera_size,
             "camera_widths": self.camera_size,
             "horizon": self.horizon,
@@ -215,7 +217,7 @@ class RobosuiteGymWrapper:
             f"Successfully created {env_name} environment via robosuite.make() "
             f"with cameras at {camera_size}x{camera_size}"
         )
-        logger.debug(f"Configured cameras: {camera_names}")
+        logger.debug(f"Configured cameras: {robosuite_camera_names}")
 
         # The `num_envs` argument is supported for legacy reasons, will remove at some point soon
         if num_envs != 1:
@@ -378,6 +380,23 @@ class RobosuiteGymWrapper:
             self._logged_obs_keys = True
 
         return processed_obs
+
+    @staticmethod
+    def _normalize_camera_names(camera_names: list[str] | None) -> list[str] | None:
+        """Normalize camera names to robosuite image observation keys."""
+        if not camera_names:
+            return None
+
+        image_keys = []
+        for camera_name in camera_names:
+            clean_name = camera_name
+            if clean_name.startswith("observation.images."):
+                clean_name = clean_name.replace("observation.images.", "", 1)
+            if clean_name.endswith("_image"):
+                image_keys.append(clean_name)
+            else:
+                image_keys.append(f"{clean_name}_image")
+        return image_keys
 
     def _get_expected_image_keys(self, env_name: str):
         """Return the expected image keys for a given environment.
@@ -543,6 +562,7 @@ def make_dexmimicgen_env(
     render_size: tuple[int, int] | int | None = None,
     render_gpu_device_id: int = 0,
     env_id: int = 0,
+    camera_names: list[str] | None = None,
 ):
     """Factory function to create a DexMimicGen environment for vectorization."""
 
@@ -554,6 +574,7 @@ def make_dexmimicgen_env(
             camera_size=camera_size,
             render_size=render_size,
             env_id=env_id,
+            camera_names=camera_names,
         )
 
     return _make
@@ -629,6 +650,7 @@ def create_vectorized_env(
     render_size: tuple[int, int] | int | None = None,
     debug: bool = False,
     video_key: str = "observation.images.agentview",
+    camera_names: list[str] | None = None,
 ) -> VectorizedEnvWrapper:
     """Create vectorized environment using Gymnasium's vector environments."""
 
@@ -652,7 +674,16 @@ def create_vectorized_env(
             render_gpu_device_id = visible_device_ids[env_id % num_visible_gpus]
         else:
             render_gpu_device_id = visible_device_ids[0] if visible_device_ids else 0
-        env_fns.append(make_dexmimicgen_env(env_name, camera_size, render_size, render_gpu_device_id, env_id))
+        env_fns.append(
+            make_dexmimicgen_env(
+                env_name,
+                camera_size,
+                render_size,
+                render_gpu_device_id,
+                env_id,
+                camera_names=camera_names,
+            )
+        )
 
     if debug:
         # Use synchronous vectorized environment for debugging

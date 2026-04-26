@@ -173,24 +173,26 @@ def run_dexmg_evaluation(
         # 1. Policy inference + Q-value prediction ---------------------
         # --------------------------------------------------------------
         with torch.no_grad():
-            actions = q_actions = agent.act(obs, eval_mode=True, stddev=0.0, cpu=False)
-
             # Build features on-the-fly to obtain Q-predictions --------
             obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
             obs_q["feat"] = agent._encode(obs_q, augment=False)
+            policy_output = agent._forward_actor_policy(obs_q, stddev=0.0, use_target=False)
+            residual_action = agent._sample_action_from_policy_output(policy_output, eval_mode=True, clip=None)
 
-            # For Q-value computation, use combined action and clamp to [-1, 1] (consistent with training)
-            if agent.residual_actor:
-                q_actions = torch.clamp(obs["observation.base_action"] + actions, -1.0, 1.0)
+            horizon_onehot = None
+            if agent.uses_adaptive_horizons:
+                if policy_output.horizon_logits is None:
+                    raise RuntimeError("Adaptive horizon policy is enabled but evaluation received no horizon logits.")
+                horizon_onehot, _ = agent._sample_horizon_onehot(policy_output.horizon_logits, eval_mode=True)
 
-            q_pred = (
-                agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)
-            )
+            actions = agent._build_env_action(residual_action, horizon_onehot)
+            q_actions = agent._build_critic_actions(obs_q, residual_action, horizon_onehot=horizon_onehot)
+            q_pred = agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)
 
         # --------------------------------------------------------------
         # 2. Environment step ------------------------------------------
         # --------------------------------------------------------------
-        next_obs, reward, terminated, truncated, _ = env.step(actions)
+        next_obs, reward, terminated, truncated, info = env.step(actions)
         done_flags = terminated | truncated
 
         # Capture frames ------------------------------------------------
@@ -203,13 +205,19 @@ def run_dexmg_evaluation(
         # 3. Per-environment bookkeeping -------------------------------
         # --------------------------------------------------------------
         for env_idx in range(num_envs):
-            ep_rewards[env_idx].append(reward[env_idx].item())
+            if "undiscounted_reward" in info:
+                ep_rewards[env_idx].append(info["undiscounted_reward"][env_idx].item())
+            else:
+                ep_rewards[env_idx].append(reward[env_idx].item())
             ep_q_preds[env_idx].append(q_pred[env_idx].item())
 
             if done_flags[env_idx]:
                 # Episode finished -- aggregate results ----------------
                 ep_return = float(sum(ep_rewards[env_idx]))
-                is_success = bool(reward[env_idx].item() == 1.0)
+                if "macro_success" in info:
+                    is_success = bool(info["macro_success"][env_idx].item())
+                else:
+                    is_success = bool(reward[env_idx].item() == 1.0)
 
                 # Update progress display
                 progress_dots[done_episodes] = "✓" if is_success else "✗"

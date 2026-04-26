@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
 
@@ -26,6 +28,30 @@ def build_fc(in_dim, hidden_dim, action_dim, num_layer, layer_norm, dropout, use
     layers.append(nn.Linear(dims[-1], action_dim))
     layers.append(nn.Tanh())
     return nn.Sequential(*layers)
+
+
+def build_mlp_trunk(in_dim, hidden_dim, num_layer, layer_norm, dropout, use_layer_norm=True):
+    dims = [in_dim]
+    dims.extend([hidden_dim for _ in range(num_layer)])
+
+    layers = []
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        if use_layer_norm and layer_norm == 1:
+            layers.append(nn.LayerNorm(dims[i + 1]))
+        if use_layer_norm and layer_norm == 2 and (i == num_layer - 1):
+            layers.append(nn.LayerNorm(dims[i + 1]))
+        layers.append(nn.Dropout(dropout))
+        layers.append(nn.ReLU())
+
+    if not layers:
+        return nn.Identity(), in_dim
+    return nn.Sequential(*layers), dims[-1]
+
+
+class ActorOutput(NamedTuple):
+    action_dist: utils.TruncatedNormal
+    horizon_logits: torch.Tensor | None
 
 
 class SpatialEmb(nn.Module):
@@ -66,12 +92,22 @@ class SpatialEmb(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, repr_dim, patch_repr_dim, prop_dim, action_dim, cfg: ActorConfig, residual_actor: bool = False):
+    def __init__(
+        self,
+        repr_dim,
+        patch_repr_dim,
+        prop_dim,
+        action_dim,
+        cfg: ActorConfig,
+        residual_actor: bool = False,
+        horizon_choices: tuple[int, ...] | None = None,
+    ):
         super().__init__()
 
         self.prop_dim = prop_dim
         self.residual_actor = residual_actor
         self.cfg = cfg
+        self.horizon_choices = tuple(horizon_choices or ())
 
         if residual_actor:
             # The residual actor takes the base action as input alongside the state
@@ -100,16 +136,16 @@ class Actor(nn.Module):
         if self.prop_dim > 0:
             policy_in_dim += self.prop_dim
 
-        # Create policy network
-        self.policy = build_fc(
+        self.policy_trunk, trunk_out_dim = build_mlp_trunk(
             policy_in_dim,
             cfg.hidden_dim,
-            action_dim,
             num_layer=cfg.num_layers,
             layer_norm=1,
             dropout=cfg.dropout,
             use_layer_norm=cfg.use_layer_norm,
         )
+        self.action_head = nn.Sequential(nn.Linear(trunk_out_dim, action_dim), nn.Tanh())
+        self.horizon_head = nn.Linear(trunk_out_dim, len(self.horizon_choices)) if self.horizon_choices else None
 
         # Apply weight initialization
         self._initialize_weights(cfg)
@@ -129,23 +165,18 @@ class Actor(nn.Module):
             # Use the specified distribution for compression layers
             utils.apply_initialization_to_network(self.compress, intermediate_init)
 
-        # Initialize policy network intermediate layers (exclude final layer)
-        utils.apply_initialization_to_network(self.policy, intermediate_init, exclude_final_layer=True)
+        utils.apply_initialization_to_network(self.policy_trunk, intermediate_init)
+        utils.apply_initialization_to_network(self.action_head, intermediate_init, exclude_final_layer=True)
+        if self.horizon_head is not None:
+            utils.initialize_layer_weights(self.horizon_head, intermediate_init)
 
         # Initialize final layer with specific configuration if provided
         if cfg.actor_last_layer_init_scale is not None:
-            final_layer = None
-            for module in reversed(list(self.policy.modules())):
-                if isinstance(module, nn.Linear):
-                    final_layer = module
-                    break
-
-            if final_layer is not None:
-                utils.initialize_layer_weights(
-                    final_layer,
-                    cfg.actor_last_layer_init_distribution,
-                    cfg.actor_last_layer_init_scale,
-                )
+            utils.initialize_layer_weights(
+                self.action_head[0],
+                cfg.actor_last_layer_init_distribution,
+                cfg.actor_last_layer_init_scale,
+            )
 
     def forward(self, obs: dict[str, torch.Tensor], std: float):
         if isinstance(self.compress, SpatialEmb):
@@ -164,8 +195,10 @@ class Actor(nn.Module):
                 all_input.append(obs["observation.base_action"])
 
         policy_input = torch.cat(all_input, dim=-1)
+        trunk_out = self.policy_trunk(policy_input)
 
-        mu: torch.Tensor = self.policy(policy_input)
+        mu: torch.Tensor = self.action_head(trunk_out)
+        horizon_logits = self.horizon_head(trunk_out) if self.horizon_head is not None else None
 
         # Scale the mean by action_scale
         # NOTE: std is already in environment action space (more interpretable)
@@ -174,4 +207,4 @@ class Actor(nn.Module):
         # Create distribution with scaled mean but environment-scale std
         action_dist = utils.TruncatedNormal(scaled_mu, std)
 
-        return action_dist  # noqa: RET504
+        return ActorOutput(action_dist=action_dist, horizon_logits=horizon_logits)  # noqa: RET504

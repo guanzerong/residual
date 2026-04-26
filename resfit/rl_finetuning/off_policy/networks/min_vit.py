@@ -103,18 +103,51 @@ class MinVit(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patch, embed_dim))
         layers = [TransformerLayer(embed_dim, num_head, 0) for _ in range(depth)]
 
-        self.net = nn.Sequential(*layers)
+        self.net = nn.ModuleList(layers)
         self.norm = nn.LayerNorm(embed_dim)
         self.num_patches = self.patch_embed.num_patch
+        self.depth = depth
 
         # weight init
         trunc_normal_(self.pos_embed, std=0.02)
         named_apply(init_weights_vit_timm, self)
 
-    def forward(self, x):
+    def forward(self, x, *, layer_prefix_tokens: list[torch.Tensor | None] | None = None):
         x = self.patch_embed(x)
         x = x + self.pos_embed
-        x = self.net(x)
+
+        if layer_prefix_tokens is not None and len(layer_prefix_tokens) != self.depth:
+            raise ValueError(
+                f"Expected {self.depth} per-layer prefix entries, got {len(layer_prefix_tokens)}."
+            )
+
+        for layer_idx, block in enumerate(self.net):
+            prefix_tokens = None if layer_prefix_tokens is None else layer_prefix_tokens[layer_idx]
+            prefix_len = 0
+
+            if prefix_tokens is not None:
+                if prefix_tokens.dim() == 2:
+                    prefix_tokens = prefix_tokens.unsqueeze(1)
+                if prefix_tokens.dim() != 3:
+                    raise ValueError(
+                        f"prefix_tokens must have shape [B, P, D], got {tuple(prefix_tokens.shape)}"
+                    )
+                if prefix_tokens.shape[0] != x.shape[0]:
+                    raise ValueError(
+                        f"prefix_tokens batch size {prefix_tokens.shape[0]} does not match input batch size {x.shape[0]}"
+                    )
+                if prefix_tokens.shape[-1] != x.shape[-1]:
+                    raise ValueError(
+                        f"prefix_tokens dim {prefix_tokens.shape[-1]} does not match embed dim {x.shape[-1]}"
+                    )
+                prefix_tokens = prefix_tokens.to(device=x.device, dtype=x.dtype)
+                prefix_len = int(prefix_tokens.shape[1])
+                x = torch.cat([prefix_tokens, x], dim=1)
+
+            x = block(x)
+            if prefix_len > 0:
+                x = x[:, prefix_len:, :]
+
         return self.norm(x)
 
 

@@ -117,6 +117,8 @@ parser.add_argument("--save_freq", type=int, default=10_000, help="How often to 
 parser.add_argument("--wandb_enable", action="store_true", help="Enable Weights & Biases logging")
 parser.add_argument("--wandb_project", type=str, default=None, help="W&B project name (required when --wandb_enable)")
 parser.add_argument("--wandb_entity", type=str, default=None)
+parser.add_argument("--wandb_name", type=str, default=None, help="Optional W&B run name override")
+parser.add_argument("--wandb_group", type=str, default=None, help="Optional W&B group name")
 
 # Resume
 parser.add_argument("--resume_ckpt", type=str, default=None, help="Path to a local checkpoint directory to resume from")
@@ -317,6 +319,7 @@ def _run_rollouts(
     video_writer = imageio.get_writer(video_path.as_posix(), fps=20)
 
     obs, _ = env.reset()
+    policy.reset()
     episode_frames = [[] for _ in range(num_parallel_envs)]
     episode_steps = [0] * num_parallel_envs
 
@@ -325,6 +328,10 @@ def _run_rollouts(
         with torch.inference_mode():
             # Convert numpy observations to PyTorch tensors for the policy
             action = policy.select_action(obs)
+            if isinstance(action, torch.Tensor):
+                action = action.clamp(-1.0, 1.0)
+            else:
+                action = np.clip(action, -1.0, 1.0)
 
         obs, reward, terminated, truncated, info = env.step(action)
 
@@ -474,9 +481,29 @@ def main(cfg: argparse.Namespace):
 
     policy_cfg = make_policy_config(cfg.policy, **policy_kwargs)
 
-    # Set the chunk size to 20 (env is at 20 fps)
-    policy_cfg.chunk_size = 20
-    policy_cfg.n_action_steps = 20
+    # Preserve the historical 1-second ACT default for this script, but do not
+    # override explicit policy_kwargs. This is required for testing ACT temporal
+    # ensembling, where n_action_steps must stay at 1.
+    if hasattr(policy_cfg, "chunk_size") and "chunk_size" not in policy_kwargs:
+        policy_cfg.chunk_size = 20
+    if hasattr(policy_cfg, "n_action_steps") and "n_action_steps" not in policy_kwargs:
+        policy_cfg.n_action_steps = min(20, int(getattr(policy_cfg, "chunk_size", 20)))
+
+    if (
+        getattr(policy_cfg, "temporal_ensemble_coeff", None) is not None
+        and getattr(policy_cfg, "n_action_steps", 1) > 1
+    ):
+        raise ValueError("ACT temporal ensembling requires n_action_steps=1.")
+    if getattr(policy_cfg, "n_action_steps", 1) > getattr(policy_cfg, "chunk_size", 1):
+        raise ValueError("n_action_steps must be <= chunk_size.")
+
+    if hasattr(policy_cfg, "chunk_size") and hasattr(policy_cfg, "n_action_steps"):
+        logger.info(
+            "Policy inference config: "
+            f"chunk_size={policy_cfg.chunk_size}, "
+            f"n_action_steps={policy_cfg.n_action_steps}, "
+            f"temporal_ensemble_coeff={getattr(policy_cfg, 'temporal_ensemble_coeff', None)}"
+        )
 
     if isinstance(cfg.device, str):
         # e.g. "cuda:0" -> "cuda"
@@ -624,7 +651,8 @@ def main(cfg: argparse.Namespace):
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             config=extra_cfg,
-            name=f"{cfg.policy}_{Path(cfg.dataset).name}",
+            name=cfg.wandb_name or f"{cfg.policy}_{Path(cfg.dataset).name}",
+            group=cfg.wandb_group,
             id=wandb_run_id,
             resume="must" if wandb_run_id else None,
         )
@@ -709,6 +737,7 @@ def main(cfg: argparse.Namespace):
                     camera_size=cfg.eval_camera_size,
                     render_size=cfg.eval_render_size,
                     video_key=cfg.eval_video_key,
+                    camera_names=cfg.policy_cameras,
                     debug=True,
                 )
             else:
@@ -721,6 +750,7 @@ def main(cfg: argparse.Namespace):
                     camera_size=cfg.eval_camera_size,
                     render_size=cfg.eval_render_size,
                     video_key=cfg.eval_video_key,
+                    camera_names=cfg.policy_cameras,
                     debug=False,
                 )
         else:

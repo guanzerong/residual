@@ -61,6 +61,14 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # False: residual_action = pure_random - base_action (resulting in pure_random)
     use_base_policy_for_warmup: bool = True
 
+    # Number of primitive actions corrected by a single residual action.
+    # Keep this at 1 to preserve the original single-step residual TD3 behaviour.
+    macro_action_horizon: int = 1
+    adaptive_macro_enabled: bool = False
+    adaptive_macro_horizons: tuple[int, ...] = (4, 5, 6)
+    adaptive_macro_offline_stride: int = 4
+    adaptive_macro_horizon_entropy_reg: float = 0.0
+
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
     # ------------------------------------------------------------------

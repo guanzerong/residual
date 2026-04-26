@@ -157,6 +157,10 @@ def _add_transitions_to_buffer(
     lowdim_keys: list[str],
     num_envs: int,
     online_rb: TensorDictPrioritizedReplayBuffer,
+    add_batch_dim: bool = True,
+    depth_cls_cache_fn=None,
+    depth_patch_cache_fn=None,
+    base_act_encoder_cache_fn=None,
 ) -> None:
     """Helper function to create transitions and add them to the replay buffer.
 
@@ -176,6 +180,15 @@ def _add_transitions_to_buffer(
         # Keep only relevant keys & convert images to uint8 for storage
         curr_obs_i = {k: v for k, v in curr_obs_i.items() if k in obs_keys_set}
         next_obs_i = {k: v for k, v in next_obs_i.items() if k in obs_keys_set}
+        if depth_cls_cache_fn is not None:
+            curr_obs_i.update(depth_cls_cache_fn(curr_obs_i))
+            next_obs_i.update(depth_cls_cache_fn(next_obs_i))
+        if depth_patch_cache_fn is not None:
+            curr_obs_i.update(depth_patch_cache_fn(curr_obs_i))
+            next_obs_i.update(depth_patch_cache_fn(next_obs_i))
+        if base_act_encoder_cache_fn is not None:
+            curr_obs_i.update(base_act_encoder_cache_fn(curr_obs_i))
+            next_obs_i.update(base_act_encoder_cache_fn(next_obs_i))
         to_uint8(curr_obs_i, image_keys)
         to_uint8(next_obs_i, image_keys)
 
@@ -194,9 +207,55 @@ def _add_transitions_to_buffer(
                 "_priority": torch.tensor(10.0, dtype=torch.float32),  # High initial priority for new samples
             },
             batch_size=[],
-        ).unsqueeze(0)
+        )
+        if "gamma" in info:
+            td.set("gamma", info["gamma"][i].detach().cpu())
+        if "nonterminal" in info:
+            td.set("nonterminal", info["nonterminal"][i].detach().cpu())
+        if "chosen_horizon" in info:
+            td.set("chosen_horizon", info["chosen_horizon"][i].detach().cpu())
+        if "executed_horizon" in info:
+            td.set("executed_horizon", info["executed_horizon"][i].detach().cpu())
 
-        online_rb.add(td)
+        online_rb.add(td.unsqueeze(0) if add_batch_dim else td)
+
+
+def _flatten_or_pad_action_chunk(
+    action_chunk: torch.Tensor,
+    *,
+    chunk_horizon: int,
+    primitive_action_dim: int,
+) -> torch.Tensor:
+    """Pad a variable-length primitive action chunk and flatten it into a single macro action vector."""
+    if action_chunk.ndim != 2:
+        raise ValueError(f"Expected action_chunk to have shape [T, A], got {tuple(action_chunk.shape)}")
+
+    padded = torch.zeros(
+        (chunk_horizon, primitive_action_dim),
+        dtype=action_chunk.dtype,
+        device=action_chunk.device,
+    )
+    valid_steps = min(action_chunk.shape[0], chunk_horizon)
+    if valid_steps > 0:
+        padded[:valid_steps] = action_chunk[:valid_steps]
+    return padded.reshape(-1)
+
+
+def _discounted_sum(rewards: list[torch.Tensor], gamma: float) -> torch.Tensor:
+    total = torch.zeros((), dtype=torch.float32, device=rewards[0].device if rewards else "cpu")
+    for step_idx, reward in enumerate(rewards):
+        total = total + (gamma**step_idx) * reward.float()
+    return total
+
+
+def _primitive_step_count_from_info(info: dict, default_num_envs: int) -> int:
+    primitive_steps = info.get("primitive_steps")
+    if primitive_steps is None:
+        return default_num_envs
+    if isinstance(primitive_steps, torch.Tensor):
+        return int(primitive_steps.sum().item())
+    primitive_steps_arr = np.asarray(primitive_steps)
+    return int(primitive_steps_arr.sum())
 
 
 # -----------------------------------------------------------------------------
@@ -257,6 +316,28 @@ def main(cfg: ResidualTD3DexmgConfig):
         device=device,
     )
 
+    macro_action_horizon = int(cfg.algo.macro_action_horizon)
+    use_macro_actions = macro_action_horizon > 1
+    adaptive_horizons = tuple(sorted(int(h) for h in cfg.algo.adaptive_macro_horizons)) if cfg.algo.adaptive_macro_enabled else ()
+    use_adaptive_macro_actions = use_macro_actions and bool(adaptive_horizons)
+    if cfg.algo.adaptive_macro_enabled and not use_macro_actions:
+        raise ValueError("adaptive_macro_enabled requires macro_action_horizon > 1.")
+    if use_adaptive_macro_actions and adaptive_horizons[-1] != macro_action_horizon:
+        raise ValueError(
+            "adaptive_macro_horizons must end at macro_action_horizon. "
+            f"Got adaptive_macro_horizons={adaptive_horizons}, macro_action_horizon={macro_action_horizon}."
+        )
+
+    replay_n_step = 1 if use_macro_actions else cfg.algo.n_step
+    replay_gamma = cfg.algo.gamma**macro_action_horizon if (use_macro_actions and not use_adaptive_macro_actions) else cfg.algo.gamma
+    if use_macro_actions:
+        print(
+            "Macro residual mode enabled: "
+            f"horizon={macro_action_horizon}, replay_n_step={replay_n_step}, replay_gamma={replay_gamma:.6f}"
+        )
+    if use_adaptive_macro_actions:
+        print(f"Adaptive macro horizon choices enabled: {adaptive_horizons}")
+
     def get_envs(
         env_name: str,
         num_envs: int,
@@ -285,6 +366,9 @@ def main(cfg: ResidualTD3DexmgConfig):
             base_policy=base_policy,
             action_scaler=action_scaler,
             state_standardizer=state_standardizer,
+            macro_action_horizon=macro_action_horizon,
+            macro_discount_gamma=cfg.algo.gamma,
+            adaptive_horizons=adaptive_horizons if use_adaptive_macro_actions else (),
         )
 
     # ---------------------------------------------------------------------
@@ -324,6 +408,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     cfg.eval_num_envs = min(cfg.eval_num_envs, cfg.eval_num_episodes)
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
     cfg.eval_num_envs = min(num_cpus_available, cfg.eval_num_envs)
+    if use_macro_actions:
+        cfg.eval_num_envs = 1
 
     eval_env = get_envs(
         env_name=cfg.task,
@@ -356,6 +442,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     lowdim_dim = env.observation_space["observation.state"].shape[1]
     img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
     action_dim = env.action_space.shape[1]
+    base_action_dim = env.base_action_dim if hasattr(env, "base_action_dim") else action_dim
 
     lowdim_keys = ["observation.state", "observation.base_action"]
 
@@ -369,7 +456,50 @@ def main(cfg: ResidualTD3DexmgConfig):
         rl_cameras=image_keys,
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
+        base_action_dim=base_action_dim,
+        primitive_action_dim=env.primitive_action_dim if hasattr(env, "primitive_action_dim") else None,
+        adaptive_horizons=adaptive_horizons if use_adaptive_macro_actions else None,
+        adaptive_horizon_entropy_reg=cfg.algo.adaptive_macro_horizon_entropy_reg,
+        task_name=cfg.task,
+        action_scaler_min=action_scaler.limits.min.detach().cpu(),
+        action_scaler_max=action_scaler.limits.max.detach().cpu(),
+        state_mean=state_standardizer.mean.detach().cpu(),
+        state_std=state_standardizer.std.detach().cpu(),
+        base_policy=base_policy,
     )
+    depth_cls_cache_fn = None
+    offline_depth_cls_cache_fn = None
+    depth_patch_cache_fn = None
+    offline_depth_patch_cache_fn = None
+    base_act_encoder_cache_fn = None
+    offline_base_act_encoder_cache_fn = None
+    if agent.uses_depth_anything_v2_conditioning:
+        print("Depth CLS replay caching enabled.")
+
+        def depth_cls_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_depth_cls_cache(obs_dict, cpu=False)
+
+        def offline_depth_cls_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_depth_cls_cache(obs_dict, cpu=True)
+
+    if agent.uses_depth_patch_state:
+        print("Depth patch replay caching enabled.")
+
+        def depth_patch_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_depth_patch_cache(obs_dict, cpu=False)
+
+        def offline_depth_patch_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_depth_patch_cache(obs_dict, cpu=True)
+
+    if agent.uses_base_act_encoder_state:
+        print("Base ACT encoder replay caching enabled.")
+
+        def base_act_encoder_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_base_act_encoder_cache(obs_dict, cpu=False)
+
+        def offline_base_act_encoder_cache_fn(obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return agent.compute_base_act_encoder_cache(obs_dict, cpu=True)
+
     horizon = env.vec_env.metadata["horizon"]
 
     # Set up actor learning rate warmup
@@ -397,17 +527,19 @@ def main(cfg: ResidualTD3DexmgConfig):
         print("Online-only training mode: offline_fraction=0.0")
 
     # Use TensorDictPrioritizedReplayBuffer with optimized prefetching
-    online_rb = TensorDictPrioritizedReplayBuffer(
+    online_rb_kwargs = dict(
         storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
         alpha=alpha,
         beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
+        eps=1e-6,
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
         pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
+        prefetch=cfg.algo.prefetch_batches,
         batch_size=online_batch_size,
     )
+    if not use_adaptive_macro_actions:
+        online_rb_kwargs["transform"] = MultiStepTransform(n_steps=replay_n_step, gamma=replay_gamma)
+    online_rb = TensorDictPrioritizedReplayBuffer(**online_rb_kwargs)
 
     # ------------------------------------------------------------------
     # Caching layer for online replay buffer ----------------------------
@@ -415,28 +547,134 @@ def main(cfg: ResidualTD3DexmgConfig):
     online_cache_meta = {
         "task": cfg.task,
         "image_keys": image_keys,
-        "n_step": cfg.algo.n_step,
-        "gamma": cfg.algo.gamma,
+        "n_step": replay_n_step,
+        "gamma": replay_gamma,
         "horizon": horizon,
         "size": cfg.algo.learning_starts,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "buffer_size": cfg.algo.buffer_size,
         "batch_size": online_batch_size,
+        "macro_action_horizon": macro_action_horizon,
+        "adaptive_macro_horizons": adaptive_horizons,
+        "uses_sampled_gamma": use_adaptive_macro_actions,
+        "adaptive_macro_buffer_format_version": 2 if use_adaptive_macro_actions else 1,
         # Include random action noise scale to prevent mixing data from different noise levels
         "random_action_noise_scale": cfg.algo.random_action_noise_scale,
         # Normalization parameters for consistency
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
         "normalized_actions": True,
+        "agent_vit_depth": cfg.agent.vit.depth,
+        "agent_use_residual_image_encoder": cfg.agent.use_residual_image_encoder,
+        "agent_use_base_act_encoder_state": cfg.agent.use_base_act_encoder_state,
+        "cached_base_act_encoder_tokens": agent.uses_base_act_encoder_state,
+        "depth_anything_v2_conditioning_enabled": agent.uses_depth_anything_v2_conditioning,
+        "cached_depth_cls": agent.uses_depth_anything_v2_conditioning,
+        "depth_anything_v2_patch_state_enabled": agent.uses_depth_patch_state,
+        "cached_depth_patch_tokens": agent.uses_depth_patch_state,
         # Library versions for compatibility
         "torchrl_version": torchrl.__version__,
         "tensordict_version": tensordict.__version__,
     }
+    if agent.uses_depth_anything_v2_conditioning:
+        online_cache_meta["depth_anything_v2_encoder"] = cfg.agent.depth_anything_v2_conditioning.encoder
+        online_cache_meta["depth_anything_v2_num_conditioned_layers"] = (
+            cfg.agent.depth_anything_v2_conditioning.num_conditioned_layers
+        )
+    if agent.uses_depth_patch_state:
+        depth_patch_cfg = cfg.agent.depth_anything_v2_patch_state
+        online_cache_meta.update(
+            {
+                "depth_patch_cache_version": 1,
+                "depth_patch_cache_dtype": "float16",
+                "depth_patch_encoder": depth_patch_cfg.encoder,
+                "depth_patch_weights": depth_patch_cfg.weights,
+                "depth_patch_num_intermediate_layers": depth_patch_cfg.num_intermediate_layers,
+                "depth_patch_feature_layer": depth_patch_cfg.feature_layer,
+                "depth_patch_resize_to": depth_patch_cfg.resize_to,
+                "depth_patch_mean": list(depth_patch_cfg.mean),
+                "depth_patch_std": list(depth_patch_cfg.std),
+                "depth_patch_camera_keys": list(agent.depth_patch_camera_keys),
+                "depth_patch_selection_mode": agent.depth_patch_selection_mode,
+                "depth_patch_max_tokens_per_camera": agent.depth_patch_max_tokens_per_camera,
+                "depth_patch_action_scaler_min": action_scaler.limits.min.detach().cpu().tolist(),
+                "depth_patch_action_scaler_max": action_scaler.limits.max.detach().cpu().tolist(),
+                "depth_patch_state_mean": state_standardizer.mean.detach().cpu().tolist(),
+                "depth_patch_state_std": state_standardizer.std.detach().cpu().tolist(),
+            }
+        )
+    if agent.uses_base_act_encoder_state:
+        online_cache_meta.update(
+            {
+                "base_act_encoder_cache_version": 1,
+                "base_act_encoder_cache_dtype": "float16",
+                "base_act_encoder_tokens": agent.base_act_encoder_num_tokens,
+                "base_act_encoder_token_dim": int(agent.base_act_encoder_projector[0].in_features),
+                "base_act_encoder_projected_dim": int(agent.base_act_encoder_projector[0].out_features),
+                "base_act_encoder_policy_wandb_id": cfg.base_policy.wandb_id,
+                "base_act_encoder_policy_wt_type": cfg.base_policy.wt_type,
+                "base_act_encoder_policy_wt_version": cfg.base_policy.wt_version,
+                "base_act_encoder_image_keys": list(base_policy.config.image_features.keys()),
+                "base_act_encoder_state_mean": state_standardizer.mean.detach().cpu().tolist(),
+                "base_act_encoder_state_std": state_standardizer.std.detach().cpu().tolist(),
+            }
+        )
     if cfg.algo.sampling_strategy == "prioritized_replay":
         online_cache_meta["priority_alpha"] = cfg.algo.priority_alpha
         online_cache_meta["priority_beta"] = cfg.algo.priority_beta
 
     pprint.pprint(online_cache_meta)
+
+    # Create the W&B run before any long cache population / warm-up work so
+    # launched jobs are visible immediately and setup failures are attributable.
+    _hp_parts: list[str] = [
+        cfg.task,
+        f"n{replay_n_step}",
+        f"utd{cfg.algo.num_updates_per_iteration}",
+        f"buf{cfg.algo.buffer_size}",
+    ]
+
+    if use_macro_actions:
+        _hp_parts.append(f"macro{macro_action_horizon}")
+    if use_adaptive_macro_actions:
+        _hp_parts.append("adaptive" + "-".join(str(h) for h in adaptive_horizons))
+
+    if cfg.offline_data is not None and cfg.offline_data.num_episodes is not None and cfg.algo.offline_fraction > 0.0:
+        _hp_parts.append(f"off{cfg.offline_data.num_episodes}ep")
+    elif cfg.algo.offline_fraction == 0.0:
+        _hp_parts.append("online_only")
+
+    _hp_parts.append(f"lr{cfg.agent.actor_lr:.0e}")
+
+    if cfg.agent.clip_q_target_to_reward_range:
+        _hp_parts.append("clipT")
+
+    hp_str = "_".join(_hp_parts)
+    run_name = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}__{hp_str}__seed{cfg.seed}"
+
+    if cfg.wandb.name is not None:
+        run_name = f"{cfg.wandb.name}__{run_name}"
+
+    _wandb_config = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(_wandb_config, dict)
+    _wandb_config["wandb"].pop("notes", None)
+
+    print("Launching run with the following config:")
+    pprint.pprint(_wandb_config)
+
+    wandb.init(
+        id=cfg.wandb.continue_run_id,
+        resume=None if cfg.wandb.continue_run_id is None else "allow",
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        config=_wandb_config,
+        name=run_name,
+        mode=cfg.wandb.mode if not cfg.debug else "disabled",
+        notes=cfg.wandb.notes,
+        group=cfg.wandb.group,
+    )
+    wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
+
     _online_meta_str = json.dumps(online_cache_meta, sort_keys=True)
     online_cache_hash = hashlib.sha1(_online_meta_str.encode()).hexdigest()[:8]  # noqa: S324
     # Base local path for the online buffer ------------------------------
@@ -466,18 +704,36 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Use actual dataset metadata for precise buffer sizing
     if cfg.offline_data.num_episodes is not None:
         # Only use subset of episodes if specified
-        total_frames = sum(
+        selected_episode_lengths = [
             dataset.meta.episodes[ep_idx]["length"]
             for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
-        )
+        ]
+        total_frames = sum(selected_episode_lengths)
         num_episodes = cfg.offline_data.num_episodes
     else:
         # Use entire dataset
         total_frames = dataset.meta.total_frames
         num_episodes = dataset.meta.total_episodes
+        selected_episode_lengths = [dataset.meta.episodes[ep_idx]["length"] for ep_idx in range(dataset.meta.total_episodes)]
 
-    # Calculate transitions: each episode contributes (episode_length - 1) transitions
-    estimated_transitions = max(0, total_frames - num_episodes)
+    # Calculate transitions: single-step uses frame pairs, macro mode aggregates them in stride-H windows.
+    if use_adaptive_macro_actions:
+        min_horizon = min(adaptive_horizons)
+        offline_stride = max(1, int(cfg.algo.adaptive_macro_offline_stride))
+        estimated_transitions = 0
+        for episode_length in selected_episode_lengths:
+            primitive_transitions = max(0, episode_length - 1)
+            if primitive_transitions < min_horizon:
+                continue
+            estimated_starts = max(0, ((primitive_transitions - min_horizon) // offline_stride) + 1)
+            estimated_transitions += estimated_starts * len(adaptive_horizons)
+    elif use_macro_actions:
+        estimated_transitions = sum(
+            max(0, (episode_length - 1 + macro_action_horizon - 1) // macro_action_horizon)
+            for episode_length in selected_episode_lengths
+        )
+    else:
+        estimated_transitions = max(0, total_frames - num_episodes)
 
     print("Dataset buffer sizing:")
     print(f"  Total frames to process: {total_frames}")
@@ -493,17 +749,19 @@ def main(cfg: ResidualTD3DexmgConfig):
     else:
         print("Online-only mode: creating minimal offline buffer (unused)")
 
-    offline_rb = TensorDictPrioritizedReplayBuffer(
+    offline_rb_kwargs = dict(
         storage=LazyTensorStorage(max_size=max_offline_transitions, device="cpu"),
         alpha=alpha,
         beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
+        eps=1e-6,
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
         pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
-        batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
+        prefetch=cfg.algo.prefetch_batches,
+        batch_size=max(offline_batch_size, 1),
     )
+    if not use_adaptive_macro_actions:
+        offline_rb_kwargs["transform"] = MultiStepTransform(n_steps=replay_n_step, gamma=replay_gamma)
+    offline_rb = TensorDictPrioritizedReplayBuffer(**offline_rb_kwargs)
 
     # Normalization functions already defined above - use them
 
@@ -517,6 +775,13 @@ def main(cfg: ResidualTD3DexmgConfig):
         num_episodes: int | None = None,
         use_base_policy_for_base_actions: bool = False,
         base_policy: ACTPolicy | None = None,
+        macro_action_horizon: int = 1,
+        macro_discount_gamma: float = 0.99,
+        adaptive_horizons: tuple[int, ...] = (),
+        adaptive_macro_offline_stride: int = 1,
+        depth_cls_cache_fn=None,
+        depth_patch_cache_fn=None,
+        base_act_encoder_cache_fn=None,
     ) -> int:
         """
         Iterates through *dataset* sequentially, converts consecutive frames
@@ -535,14 +800,104 @@ def main(cfg: ResidualTD3DexmgConfig):
         """
         if use_base_policy_for_base_actions and base_policy is None:
             raise ValueError("base_policy must be provided when use_base_policy_for_base_actions=True")
+        if macro_action_horizon > 1 and not use_base_policy_for_base_actions:
+            raise ValueError(
+                "Macro offline buffer construction currently requires "
+                "offline_data.use_base_policy_for_base_actions=True."
+            )
 
         # Populate buffer from pre-loaded dataset
         print("Populating offline buffer from dataset...")
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
         episode_cache: dict[int, dict] = {}
+        episode_macro_cache: dict[int, list[TensorDict]] = {}
         transitions = 0
-        step_id = 0
+        use_adaptive_macro = macro_action_horizon > 1 and len(adaptive_horizons) > 0
+        offline_stride = max(1, int(adaptive_macro_offline_stride))
+        min_adaptive_horizon = min(adaptive_horizons) if use_adaptive_macro else 1
+
+        def _flush_macro_episode(ep_idx: int) -> None:
+            nonlocal transitions
+            primitive_transitions = episode_macro_cache.pop(ep_idx, [])
+            if use_adaptive_macro:
+                if len(primitive_transitions) < min_adaptive_horizon:
+                    return
+                for start_idx in range(0, len(primitive_transitions) - min_adaptive_horizon + 1, offline_stride):
+                    for horizon_idx, horizon in enumerate(adaptive_horizons):
+                        window = primitive_transitions[start_idx : start_idx + horizon]
+                        if len(window) < horizon:
+                            continue
+
+                        action_chunk = torch.stack([td["action"] for td in window], dim=0)
+                        macro_action = _flatten_or_pad_action_chunk(
+                            action_chunk,
+                            chunk_horizon=macro_action_horizon,
+                            primitive_action_dim=action_scaler.limits.min.numel(),
+                        )
+                        horizon_onehot = torch.zeros(len(adaptive_horizons), dtype=macro_action.dtype)
+                        horizon_onehot[horizon_idx] = 1.0
+                        macro_action = torch.cat([macro_action, horizon_onehot], dim=0)
+                        macro_reward = _discounted_sum([td["next"]["reward"] for td in window], macro_discount_gamma)
+                        done_tensor = window[-1]["next"]["done"].clone()
+
+                        macro_transition = TensorDict(
+                            {
+                                "obs": window[0]["obs"].clone(),
+                                "action": macro_action,
+                                "next": TensorDict(
+                                    {
+                                        "obs": window[-1]["next"]["obs"].clone(),
+                                        "done": done_tensor,
+                                        "reward": macro_reward,
+                                    },
+                                    batch_size=[],
+                                ),
+                                "gamma": torch.tensor(macro_discount_gamma**horizon, dtype=torch.float32),
+                                "nonterminal": (~done_tensor.bool()).clone(),
+                                "chosen_horizon": torch.tensor(horizon, dtype=torch.long),
+                                "executed_horizon": torch.tensor(horizon, dtype=torch.long),
+                                "_priority": torch.tensor(10.0, dtype=torch.float32),
+                            },
+                            batch_size=[],
+                        )
+
+                        rb.add(macro_transition)
+                        transitions += 1
+                return
+
+            for start_idx in range(0, len(primitive_transitions), macro_action_horizon):
+                window = primitive_transitions[start_idx : start_idx + macro_action_horizon]
+                if not window:
+                    continue
+
+                action_chunk = torch.stack([td["action"] for td in window], dim=0)
+                macro_action = _flatten_or_pad_action_chunk(
+                    action_chunk,
+                    chunk_horizon=macro_action_horizon,
+                    primitive_action_dim=action_scaler.limits.min.numel(),
+                )
+                macro_reward = _discounted_sum([td["next"]["reward"] for td in window], macro_discount_gamma)
+
+                macro_transition = TensorDict(
+                    {
+                        "obs": window[0]["obs"].clone(),
+                        "action": macro_action,
+                        "next": TensorDict(
+                            {
+                                "obs": window[-1]["next"]["obs"].clone(),
+                                "done": window[-1]["next"]["done"].clone(),
+                                "reward": macro_reward,
+                            },
+                            batch_size=[],
+                        ),
+                        "_priority": torch.tensor(10.0, dtype=torch.float32),
+                    },
+                    batch_size=[],
+                ).unsqueeze(0)
+
+                rb.add(macro_transition)
+                transitions += 1
 
         for sample in tqdm(loader, desc="Processing offline dataset"):
             ep_idx = int(sample["episode_index"].item())
@@ -568,8 +923,15 @@ def main(cfg: ResidualTD3DexmgConfig):
 
                 # Get base action from base policy
                 with torch.no_grad():
-                    base_action = base_policy.select_action(raw_obs)
-                base_action_scaled = action_scaler.scale(base_action.squeeze(0).cpu())
+                    if macro_action_horizon > 1:
+                        base_action = base_policy.select_action_chunk(
+                            raw_obs,
+                            n_action_steps=macro_action_horizon,
+                        )
+                        base_action_scaled = action_scaler.scale(base_action).squeeze(0).cpu().reshape(-1)
+                    else:
+                        base_action = base_policy.select_action(raw_obs)
+                        base_action_scaled = action_scaler.scale(base_action.squeeze(0).cpu())
             else:
                 # Use GT action as base action (original behavior)
                 base_action_scaled = gt_action_scaled
@@ -581,6 +943,12 @@ def main(cfg: ResidualTD3DexmgConfig):
             }
             for k in image_keys:
                 curr_obs[k] = sample[k].squeeze(0)
+            if depth_cls_cache_fn is not None:
+                curr_obs.update(depth_cls_cache_fn(curr_obs))
+            if depth_patch_cache_fn is not None:
+                curr_obs.update(depth_patch_cache_fn(curr_obs))
+            if base_act_encoder_cache_fn is not None:
+                curr_obs.update(base_act_encoder_cache_fn(curr_obs))
 
             # Convert images to uint8 for memory-efficient storage
             to_uint8(curr_obs, image_keys)
@@ -610,20 +978,26 @@ def main(cfg: ResidualTD3DexmgConfig):
                     batch_size=[],
                 ).unsqueeze(0)
 
-                rb.add(transition)
-                transitions += 1
-
-                step_id += 1
-            else:
-                step_id = 0
+                if macro_action_horizon > 1:
+                    episode_macro_cache.setdefault(ep_idx, []).append(transition.squeeze(0).clone())
+                    if done_flag:
+                        _flush_macro_episode(ep_idx)
+                else:
+                    rb.add(transition)
+                    transitions += 1
 
             # Cache current frame for pairing with the next one ---------------
             episode_cache[ep_idx] = {
                 "obs": curr_obs,
                 "action": gt_action_scaled,
-                "done": done_flag,
-                "step_id": step_id,
             }
+
+            if done_flag:
+                episode_cache.pop(ep_idx, None)
+
+        if macro_action_horizon > 1:
+            for ep_idx in sorted(episode_macro_cache):
+                _flush_macro_episode(ep_idx)
 
         # Log final statistics
         print(f"Added {transitions} transitions")
@@ -642,16 +1016,72 @@ def main(cfg: ResidualTD3DexmgConfig):
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
         "image_keys": image_keys,
-        "n_step": cfg.algo.n_step,
-        "gamma": cfg.algo.gamma,
+        "n_step": replay_n_step,
+        "gamma": replay_gamma,
+        "macro_action_horizon": macro_action_horizon,
+        "adaptive_macro_horizons": adaptive_horizons,
+        "uses_sampled_gamma": use_adaptive_macro_actions,
+        "adaptive_macro_buffer_format_version": 2 if use_adaptive_macro_actions else 1,
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
         "batch_size": offline_batch_size,
+        "adaptive_macro_offline_stride": cfg.algo.adaptive_macro_offline_stride,
+        "agent_vit_depth": cfg.agent.vit.depth,
+        "agent_use_residual_image_encoder": cfg.agent.use_residual_image_encoder,
+        "agent_use_base_act_encoder_state": cfg.agent.use_base_act_encoder_state,
+        "cached_base_act_encoder_tokens": agent.uses_base_act_encoder_state,
+        "depth_anything_v2_conditioning_enabled": agent.uses_depth_anything_v2_conditioning,
+        "cached_depth_cls": agent.uses_depth_anything_v2_conditioning,
+        "depth_anything_v2_patch_state_enabled": agent.uses_depth_patch_state,
+        "cached_depth_patch_tokens": agent.uses_depth_patch_state,
         # Library versions for compatibility
         "torchrl_version": torchrl.__version__,
         "tensordict_version": tensordict.__version__,
     }
+    if agent.uses_depth_anything_v2_conditioning:
+        offline_cache_meta["depth_anything_v2_encoder"] = cfg.agent.depth_anything_v2_conditioning.encoder
+        offline_cache_meta["depth_anything_v2_num_conditioned_layers"] = (
+            cfg.agent.depth_anything_v2_conditioning.num_conditioned_layers
+        )
+    if agent.uses_depth_patch_state:
+        depth_patch_cfg = cfg.agent.depth_anything_v2_patch_state
+        offline_cache_meta.update(
+            {
+                "depth_patch_cache_version": 1,
+                "depth_patch_cache_dtype": "float16",
+                "depth_patch_encoder": depth_patch_cfg.encoder,
+                "depth_patch_weights": depth_patch_cfg.weights,
+                "depth_patch_num_intermediate_layers": depth_patch_cfg.num_intermediate_layers,
+                "depth_patch_feature_layer": depth_patch_cfg.feature_layer,
+                "depth_patch_resize_to": depth_patch_cfg.resize_to,
+                "depth_patch_mean": list(depth_patch_cfg.mean),
+                "depth_patch_std": list(depth_patch_cfg.std),
+                "depth_patch_camera_keys": list(agent.depth_patch_camera_keys),
+                "depth_patch_selection_mode": agent.depth_patch_selection_mode,
+                "depth_patch_max_tokens_per_camera": agent.depth_patch_max_tokens_per_camera,
+                "depth_patch_action_scaler_min": action_scaler.limits.min.detach().cpu().tolist(),
+                "depth_patch_action_scaler_max": action_scaler.limits.max.detach().cpu().tolist(),
+                "depth_patch_state_mean": state_standardizer.mean.detach().cpu().tolist(),
+                "depth_patch_state_std": state_standardizer.std.detach().cpu().tolist(),
+            }
+        )
+    if agent.uses_base_act_encoder_state:
+        offline_cache_meta.update(
+            {
+                "base_act_encoder_cache_version": 1,
+                "base_act_encoder_cache_dtype": "float16",
+                "base_act_encoder_tokens": agent.base_act_encoder_num_tokens,
+                "base_act_encoder_token_dim": int(agent.base_act_encoder_projector[0].in_features),
+                "base_act_encoder_projected_dim": int(agent.base_act_encoder_projector[0].out_features),
+                "base_act_encoder_policy_wandb_id": cfg.base_policy.wandb_id,
+                "base_act_encoder_policy_wt_type": cfg.base_policy.wt_type,
+                "base_act_encoder_policy_wt_version": cfg.base_policy.wt_version,
+                "base_act_encoder_image_keys": list(base_policy.config.image_features.keys()),
+                "base_act_encoder_state_mean": state_standardizer.mean.detach().cpu().tolist(),
+                "base_act_encoder_state_std": state_standardizer.std.detach().cpu().tolist(),
+            }
+        )
     if cfg.algo.sampling_strategy == "prioritized_replay":
         offline_cache_meta["priority_alpha"] = cfg.algo.priority_alpha
         offline_cache_meta["priority_beta"] = cfg.algo.priority_beta
@@ -693,6 +1123,13 @@ def main(cfg: ResidualTD3DexmgConfig):
                 num_episodes=cfg.offline_data.num_episodes,
                 use_base_policy_for_base_actions=cfg.offline_data.use_base_policy_for_base_actions,
                 base_policy=base_policy if cfg.offline_data.use_base_policy_for_base_actions else None,
+                macro_action_horizon=macro_action_horizon,
+                macro_discount_gamma=cfg.algo.gamma,
+                adaptive_horizons=adaptive_horizons if use_adaptive_macro_actions else (),
+                adaptive_macro_offline_stride=cfg.algo.adaptive_macro_offline_stride,
+                depth_cls_cache_fn=offline_depth_cls_cache_fn,
+                depth_patch_cache_fn=offline_depth_patch_cache_fn,
+                base_act_encoder_cache_fn=offline_base_act_encoder_cache_fn,
             )
 
             print(f"Added {added} offline transitions to buffer (size={len(offline_rb)})")
@@ -715,40 +1152,56 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
-    if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+    warmup_primitive_steps = 0
+    if warmup_primitive_steps < cfg.algo.learning_starts and not loaded_online_from_cache:
+        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - warmup_primitive_steps} random steps…")
         obs, _ = env.reset()
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
         # --------------------------------------------------------------
         next_log_threshold = 1000  # first threshold for progress message
 
-        reward_sum = 0
-        episode_count = 0
+        reward_sum = 0.0
+        episode_count = 0.0
+        success_count = 0.0
 
-        while len(online_rb) < cfg.algo.learning_starts:
+        while warmup_primitive_steps < cfg.algo.learning_starts:
+            if use_adaptive_macro_actions:
+                horizon_idx = torch.randint(len(adaptive_horizons), (cfg.num_envs,), device=device)
+                horizon_onehot = torch.nn.functional.one_hot(horizon_idx, num_classes=len(adaptive_horizons)).float()
             if cfg.algo.use_base_policy_for_warmup:
                 # Use base policy action + noise (residual exploration)
                 # Since the environment wrapper always adds base_action to residual_action,
                 # we just need to provide the noise as the residual action
-                rand_actions = (
-                    torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
+                rand_residual = (
+                    torch.rand((cfg.num_envs, base_action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
+                rand_actions = (
+                    torch.cat([rand_residual, horizon_onehot], dim=-1) if use_adaptive_macro_actions else rand_residual
+                )
             else:
                 # Pure uniform random actions - need to cancel out the base policy action
                 # Since env does: combined = base_action + residual_action
                 # To get pure random: residual_action = random - base_action
                 base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
                 pure_random = (
-                    torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
+                    torch.rand((cfg.num_envs, base_action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
-                rand_actions = pure_random - base_action
+                rand_residual = pure_random - base_action
+                rand_actions = (
+                    torch.cat([rand_residual, horizon_onehot], dim=-1) if use_adaptive_macro_actions else rand_residual
+                )
 
             next_obs, reward, terminated, truncated, info = env.step(rand_actions)
             done = terminated | truncated
+            step_increment = _primitive_step_count_from_info(info, cfg.num_envs)
 
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
+            if "macro_success" in info:
+                success_count += info["macro_success"].float().sum().item()
+            else:
+                success_count += reward.sum().item()
 
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
@@ -764,17 +1217,22 @@ def main(cfg: ResidualTD3DexmgConfig):
                 lowdim_keys=lowdim_keys,
                 num_envs=cfg.num_envs,
                 online_rb=online_rb,
+                add_batch_dim=not use_adaptive_macro_actions,
+                depth_cls_cache_fn=depth_cls_cache_fn,
+                depth_patch_cache_fn=depth_patch_cache_fn,
+                base_act_encoder_cache_fn=base_act_encoder_cache_fn,
             )
+            warmup_primitive_steps += step_increment
 
             # ----------------------------------------------------------
             # Progress logging (every ~1 000 transitions) --------------
             # ----------------------------------------------------------
-            if len(online_rb) >= next_log_threshold:
-                success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
+            if warmup_primitive_steps >= next_log_threshold:
+                success_rate = success_count / episode_count if episode_count > 0 else 0.0
                 print(
-                    f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
-                    f"transitions collected, reward_sum={reward_sum:.2f}, "
-                    f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
+                    f"[Warm-up] {warmup_primitive_steps} / {cfg.algo.learning_starts} "
+                    f"primitive steps collected, reward_sum={reward_sum:.2f}, "
+                    f"success_rate={success_rate:.3f} ({success_count}/{episode_count})"
                 )
                 next_log_threshold += 1000
 
@@ -790,57 +1248,6 @@ def main(cfg: ResidualTD3DexmgConfig):
         print(f"Warm-up done. Online buffer size = {len(online_rb)} transitions")
 
         loaded_online_from_cache = True  # treat as cached going forward
-
-    _hp_parts: list[str] = [
-        cfg.task,  # e.g. "TwoArmBoxCleanup"
-        f"n{cfg.algo.n_step}",  # n-step horizon
-        f"utd{cfg.algo.num_updates_per_iteration}",  # updates-to-data ratio
-        f"buf{cfg.algo.buffer_size}",  # replay buffer size
-    ]
-
-    # Offline dataset statistics (if any)
-    if cfg.offline_data is not None and cfg.offline_data.num_episodes is not None and cfg.algo.offline_fraction > 0.0:
-        _hp_parts.append(f"off{cfg.offline_data.num_episodes}ep")
-    elif cfg.algo.offline_fraction == 0.0:
-        _hp_parts.append("online_only")
-
-    # Learning-rate, expressed in scientific notation for brevity (e.g. 1e-4 → 1e-04)
-    _hp_parts.append(f"lr{cfg.agent.actor_lr:.0e}")
-
-    # Additional flags ---------------------------------------------------------
-    if cfg.agent.clip_q_target_to_reward_range:
-        _hp_parts.append("clipT")
-
-    hp_str = "_".join(_hp_parts)
-
-    run_name = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}__{hp_str}__seed{cfg.seed}"
-
-    if cfg.wandb.name is not None:
-        run_name = f"{cfg.wandb.name}__{run_name}"
-
-    _wandb_config = OmegaConf.to_container(cfg, resolve=True)
-    # Remove notes from config if present
-    assert isinstance(_wandb_config, dict)
-    _wandb_config["wandb"].pop("notes", None)
-
-    # Print a nice summary of the config
-    print("Launching run with the following config:")
-    pprint.pprint(_wandb_config)
-
-    wandb.init(
-        id=cfg.wandb.continue_run_id,
-        resume=None if cfg.wandb.continue_run_id is None else "allow",
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        config=_wandb_config,
-        name=run_name,
-        mode=cfg.wandb.mode if not cfg.debug else "disabled",
-        notes=cfg.wandb.notes,
-        group=cfg.wandb.group,
-    )
-
-    # Log horizon to wandb summary
-    wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
 
     # Create a timestamped folder in CACHE_DIR for all outputs
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -858,6 +1265,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     best_eval_success_rate = 0.0
     training_cum_time = 0.0
     episode_count = 0
+    metrics: dict = {}
 
     train_start_time = time.time()
 
@@ -936,7 +1344,33 @@ def main(cfg: ResidualTD3DexmgConfig):
         )
         print("Critic warmup completed.")
 
-    while global_step <= cfg.algo.total_timesteps:
+    def _run_evaluation(step_value: int) -> None:
+        nonlocal best_eval_success_rate
+        with training_timer.time("evaluation"):
+            eval_metrics = run_dexmg_evaluation(
+                env=eval_env,
+                agent=agent,
+                num_episodes=cfg.eval_num_episodes,
+                device=device,
+                global_step=step_value,
+                save_video=cfg.save_video,
+                save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
+                run_name=run_name,
+                output_dir=outputs_dir,
+            )
+
+        current_success_rate = eval_metrics["eval/success_rate"]
+        if current_success_rate > best_eval_success_rate:
+            print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
+            best_eval_success_rate = current_success_rate
+
+    if cfg.eval_first:
+        _run_evaluation(0)
+
+    next_eval_step = cfg.eval_interval_every_steps
+    next_log_step = cfg.log_freq
+
+    while global_step < cfg.algo.total_timesteps:
         iter_start = time.time()
         # ------------------------------------------------------------------
         # (1) Collect action + Environment step ---------------------------
@@ -952,6 +1386,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
+            step_increment = _primitive_step_count_from_info(info, cfg.num_envs)
         if done.any():
             episode_count += done.float().sum().item()
             # Extract episode information from final_info
@@ -959,10 +1394,14 @@ def main(cfg: ResidualTD3DexmgConfig):
             episode_steps = final_info["episode_steps"]
             episode_indices = final_info["_episode_steps"]
 
-            # Calculate discounted episode return
-            discount_factor = cfg.algo.gamma ** episode_steps[episode_indices]
-            episode_rewards = reward.cpu().numpy()[episode_indices]
-            episode_return = np.mean(discount_factor * episode_rewards)
+            if "undiscounted_reward" in info:
+                episode_rewards = info["undiscounted_reward"].cpu().numpy()[episode_indices]
+                episode_return = float(np.mean(episode_rewards))
+            else:
+                # Calculate discounted episode return
+                discount_factor = cfg.algo.gamma ** episode_steps[episode_indices]
+                episode_rewards = reward.cpu().numpy()[episode_indices]
+                episode_return = float(np.mean(discount_factor * episode_rewards))
 
             wandb.log(
                 {
@@ -988,39 +1427,28 @@ def main(cfg: ResidualTD3DexmgConfig):
             lowdim_keys=lowdim_keys,
             num_envs=cfg.num_envs,
             online_rb=online_rb,
+            add_batch_dim=not use_adaptive_macro_actions,
+            depth_cls_cache_fn=depth_cls_cache_fn,
+            depth_patch_cache_fn=depth_patch_cache_fn,
+            base_act_encoder_cache_fn=base_act_encoder_cache_fn,
         )
 
         obs = next_obs  # roll
 
+        global_step += step_increment
+
         # ------------------------------------------------------------------
         # (3) Periodic evaluation ------------------------------------------
         # ------------------------------------------------------------------
-        if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
-            with training_timer.time("evaluation"):
-                eval_metrics = run_dexmg_evaluation(
-                    env=eval_env,
-                    agent=agent,
-                    num_episodes=cfg.eval_num_episodes,
-                    device=device,
-                    global_step=global_step,
-                    save_video=cfg.save_video,
-                    save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
-                    run_name=run_name,
-                    output_dir=outputs_dir,
-                )
-
-                # Handle model saving when success rate improves
-                current_success_rate = eval_metrics["eval/success_rate"]
-                if current_success_rate > best_eval_success_rate:
-                    print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
-                    best_eval_success_rate = current_success_rate
-
-        global_step += cfg.num_envs
+        if global_step >= next_eval_step:
+            _run_evaluation(global_step)
+            while next_eval_step <= global_step:
+                next_eval_step += cfg.eval_interval_every_steps
 
         # ------------------------------------------------------------------
         # (4) Updates -------------------------------------------------------
         # ------------------------------------------------------------------
-        if global_step % cfg.algo.update_every_n_steps == 0 or global_step == cfg.num_envs:
+        if global_step % cfg.algo.update_every_n_steps == 0 or global_step == step_increment:
             i = 0
             actor_update_cadence = cfg.algo.num_updates_per_iteration // cfg.algo.actor_updates_per_iteration
             # Normal training loop - critic is already warmed up
@@ -1092,7 +1520,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         # ------------------------------------------------------------------
         # (6) Logging -------------------------------------------------------
         # ------------------------------------------------------------------
-        if global_step % cfg.log_freq == 0:
+        if global_step >= next_log_step:
             sps = int(global_step / training_cum_time) if training_cum_time > 0 else 0
 
             # Prepare base logging dict
@@ -1176,6 +1604,8 @@ def main(cfg: ResidualTD3DexmgConfig):
                 )
 
             print(print_msg)
+            while next_log_step <= global_step:
+                next_log_step += cfg.log_freq
 
     print(f"Training finished in {time.time() - train_start_time:.2f} seconds.")
 

@@ -229,6 +229,21 @@ class StateStandardizer:
 
         return (state - mean) / std_safe
 
+    def unstandardize(self, state: torch.Tensor) -> torch.Tensor:
+        """Undo state standardization back to the original state space."""
+        mean = self._mean.to(state.device)
+        std = self._std.to(state.device)
+        std_safe = torch.maximum(std, torch.tensor(1e-8, device=state.device))
+        return state * std_safe + mean
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._mean
+
+    @property
+    def std(self) -> torch.Tensor:
+        return self._std
+
     def to(self, device: torch.device | str) -> StateStandardizer:
         """Move standardizer to a different device."""
         new_standardizer = StateStandardizer.__new__(StateStandardizer)
