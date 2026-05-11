@@ -1,5 +1,9 @@
 artifacts/
 outputs/
+datasets/
+logs/
+third_party/
+nohup.out
 __pycache__
 wandb/
 offline_buffer_cache/

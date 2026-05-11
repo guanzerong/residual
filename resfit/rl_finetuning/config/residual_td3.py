@@ -15,6 +15,11 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgo
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
     num_episodes: int | None = 300
+    # Dataset compatibility layer. "auto" keeps the existing LeRobot format
+    # when possible and adapts GR00T/OpenPI-style datasets when detected.
+    format: str = "auto"
+    task_index: int | None = None
+    base_policy_batch_size: int = 8
     # Offline data action labeling options
     use_base_policy_for_base_actions: bool = True
     # Normalization safeguards
@@ -35,9 +40,18 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
+    provider: str = "wandb_act"
     wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
+    groot_root: str = "/data_all/gzr1/code/Isaac-GR00T-n1.5"
+    groot_model_path: str = "nvidia/GR00T-N1.5-3B"
+    groot_default_prompt: str | None = None
+    groot_token_target_count: int = 32
+    groot_base_image_key: str = "observation.images.agentview"
+    groot_wrist_image_key: str = "observation.images.robot0_eye_in_hand"
+    groot_remote_host: str = "127.0.0.1"
+    groot_remote_port: int = 8775
 
 
 @dataclass
@@ -60,6 +74,33 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # True: residual_action = noise (resulting in base_action + noise)
     # False: residual_action = pure_random - base_action (resulting in pure_random)
     use_base_policy_for_warmup: bool = True
+
+    # Number of primitive actions corrected by a single residual action.
+    # Keep this at 1 to preserve the original single-step residual TD3 behaviour.
+    macro_action_horizon: int = 1
+    adaptive_macro_enabled: bool = False
+    adaptive_macro_horizons: tuple[int, ...] = (4, 5, 6)
+    adaptive_macro_offline_stride: int = 4
+    adaptive_macro_horizon_entropy_reg: float = 0.0
+    # Learns state-conditioned horizon choices from critic-estimated values.
+    # This avoids hand-written phase rules: each state gets a target distribution
+    # from Q(s, a, k) over the candidate horizons.
+    adaptive_macro_horizon_value_ce_coef: float = 0.0
+    adaptive_macro_horizon_value_temperature: float = 0.01
+    # If enabled, the actor outputs a separate padded residual action for each
+    # candidate horizon instead of reusing prefixes from one max-horizon chunk.
+    adaptive_macro_horizon_conditioned_actions: bool = False
+    # Optional score shaping for the horizon policy. These are disabled by
+    # default and only affect actor horizon selection, not critic targets.
+    adaptive_macro_horizon_length_penalty: float = 0.0
+    adaptive_macro_residual_horizon_penalty: float = 0.0
+    # Epsilon-greedy exploration over adaptive horizons during online data
+    # collection. This keeps every duration represented after warmup so the
+    # critic can continue comparing options instead of inheriting an early
+    # collapsed horizon distribution.
+    adaptive_macro_horizon_exploration_initial: float = 0.0
+    adaptive_macro_horizon_exploration_final: float = 0.0
+    adaptive_macro_horizon_exploration_steps: int = 1
 
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
@@ -162,6 +203,27 @@ class ResidualTD3SquareConfig(ResidualTD3DexmgConfig):
     )
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="robomimic-square-residual-td3"))
+
+
+@dataclass
+class ResidualTD3ToolHangConfig(ResidualTD3DexmgConfig):
+    task: str = "ToolHang"
+    video_key: str = "observation.images.sideview"
+    rl_camera: list[str] = field(
+        default_factory=lambda: [
+            "observation.images.sideview",
+            "observation.images.robot0_eye_in_hand",
+        ]
+    )
+
+    offline_data: OfflineDataConfig = field(
+        default_factory=lambda: OfflineDataConfig(
+            name="/data_all/gzr1/code/residual-offpolicy-rl-macrocls-change/datasets/robomimic-ph-toolhang-image",
+            num_episodes=200,
+        )
+    )
+
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="robomimic-toolhang-residual-td3"))
 
 
 @dataclass
@@ -271,6 +333,7 @@ cs = ConfigStore.instance()
 cs.store(name="residual_td3_dexmg_config", node=ResidualTD3DexmgConfig)
 cs.store(name="residual_td3_can_config", node=ResidualTD3CanConfig)
 cs.store(name="residual_td3_square_config", node=ResidualTD3SquareConfig)
+cs.store(name="residual_td3_toolhang_config", node=ResidualTD3ToolHangConfig)
 cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)

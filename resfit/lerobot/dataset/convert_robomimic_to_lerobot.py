@@ -218,6 +218,11 @@ def get_expected_image_keys(env_name: str) -> list[str]:
         "robot1_eye_in_hand_image",
     ]
 
+    panda_toolhang_image_keys = [
+        "sideview_image",
+        "robot0_eye_in_hand_image",
+    ]
+
     panda_transport_image_keys = [
         "agentview_image",
         "robot0_eye_in_hand_image",
@@ -242,6 +247,8 @@ def get_expected_image_keys(env_name: str) -> list[str]:
     env_lower = env_name.lower()
     if "transport" in env_lower:
         return panda_transport_image_keys
+    if "toolhang" in env_lower or "tool_hang" in env_lower:
+        return panda_toolhang_image_keys
     if "cansort" in env_lower or "can_sort" in env_lower:  # Check both variants
         return humanoid_can_sort_image_keys
     if any(task in env_lower for task in ["pouring", "coffee"]):
@@ -316,7 +323,7 @@ def get_action_names(env_name: str, action_dim: int) -> list[str]:
     is_humanoid = any(task in env_lower for task in ["pouring", "coffee", "cansort", "can_sort"])
 
     # Check if this is a single-arm environment
-    single_arm_tasks = ["lift", "can", "pickplacecan", "square", "nutassemblysquare", "threading"]
+    single_arm_tasks = ["lift", "can", "pickplacecan", "square", "nutassemblysquare", "threading", "toolhang", "tool_hang"]
     is_single_arm = any(task in env_lower for task in single_arm_tasks)
 
     if is_dexterous and action_dim == 24:

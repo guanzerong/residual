@@ -7,14 +7,22 @@ import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.init import trunc_normal_
+from torch.nn.modules.utils import _pair
+
+
+def _conv2d_out_dim(size: int, *, kernel_size: int, stride: int, padding: int = 0, dilation: int = 1) -> int:
+    return ((size + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
 
 
 class PatchEmbed1(nn.Module):
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, image_shape: tuple[int, int] = (84, 84)):
         super().__init__()
         self.conv = nn.Conv2d(3, embed_dim, kernel_size=8, stride=8)
 
-        self.num_patch = 144  # if input image is 96x96, then num_patch = 144
+        image_h, image_w = _pair(image_shape)
+        patch_h = _conv2d_out_dim(image_h, kernel_size=8, stride=8)
+        patch_w = _conv2d_out_dim(image_w, kernel_size=8, stride=8)
+        self.num_patch = int(patch_h * patch_w)
         self.patch_dim = embed_dim
 
     def forward(self, x: torch.Tensor):
@@ -24,18 +32,33 @@ class PatchEmbed1(nn.Module):
 
 
 class PatchEmbed2(nn.Module):
-    def __init__(self, embed_dim, use_norm):
+    def __init__(
+        self,
+        embed_dim,
+        use_norm,
+        image_shape: tuple[int, int] = (84, 84),
+        patch_size: int = 8,
+        stride: int = -1,
+    ):
         super().__init__()
+        kernel1 = int(patch_size)
+        stride1 = int(stride) if int(stride) > 0 else max(1, kernel1 // 2)
+        kernel2 = 3
+        stride2 = 2
         layers = [
-            nn.Conv2d(3, embed_dim, kernel_size=8, stride=4),
+            nn.Conv2d(3, embed_dim, kernel_size=kernel1, stride=stride1),
             nn.GroupNorm(embed_dim, embed_dim) if use_norm else nn.Identity(),
             nn.ReLU(),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel2, stride=stride2),
         ]
         self.embed = nn.Sequential(*layers)
 
-        # self.num_patch = 121  # if input image is 96x96, then num_patch = 121
-        self.num_patch = 81  # if input image is 84x84, then num_patch = 81
+        image_h, image_w = _pair(image_shape)
+        patch_h = _conv2d_out_dim(image_h, kernel_size=kernel1, stride=stride1)
+        patch_w = _conv2d_out_dim(image_w, kernel_size=kernel1, stride=stride1)
+        patch_h = _conv2d_out_dim(patch_h, kernel_size=kernel2, stride=stride2)
+        patch_w = _conv2d_out_dim(patch_w, kernel_size=kernel2, stride=stride2)
+        self.num_patch = int(patch_h * patch_w)
         self.patch_dim = embed_dim
 
     def forward(self, x: torch.Tensor):
@@ -89,32 +112,86 @@ class TransformerLayer(nn.Module):
 
 
 class MinVit(nn.Module):
-    def __init__(self, embed_style, embed_dim, embed_norm, num_head, depth):
+    def __init__(
+        self,
+        embed_style,
+        embed_dim,
+        embed_norm,
+        num_head,
+        depth,
+        image_shape: tuple[int, int] = (84, 84),
+        patch_size: int = 8,
+        stride: int = -1,
+    ):
         super().__init__()
 
         if embed_style == "embed1":
             raise NotImplementedError("embed1 is not tested")
-            # self.patch_embed = PatchEmbed1(embed_dim)
+            # self.patch_embed = PatchEmbed1(embed_dim, image_shape=image_shape)
         if embed_style == "embed2":
-            self.patch_embed = PatchEmbed2(embed_dim, use_norm=embed_norm)
+            self.patch_embed = PatchEmbed2(
+                embed_dim,
+                use_norm=embed_norm,
+                image_shape=image_shape,
+                patch_size=patch_size,
+                stride=stride,
+            )
         else:
             raise NotImplementedError(f"Unknown embed style {embed_style}")
 
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patch, embed_dim))
         layers = [TransformerLayer(embed_dim, num_head, 0) for _ in range(depth)]
 
-        self.net = nn.Sequential(*layers)
+        self.net = nn.ModuleList(layers)
         self.norm = nn.LayerNorm(embed_dim)
         self.num_patches = self.patch_embed.num_patch
+        self.depth = depth
 
         # weight init
         trunc_normal_(self.pos_embed, std=0.02)
         named_apply(init_weights_vit_timm, self)
 
-    def forward(self, x):
+    def forward(self, x, *, layer_prefix_tokens: list[torch.Tensor | None] | None = None):
         x = self.patch_embed(x)
+        if x.shape[1] != self.pos_embed.shape[1]:
+            raise ValueError(
+                "MinVit positional embedding length does not match image patch count. "
+                f"Got {x.shape[1]} patches from input, initialized for {self.pos_embed.shape[1]} patches."
+            )
         x = x + self.pos_embed
-        x = self.net(x)
+
+        if layer_prefix_tokens is not None and len(layer_prefix_tokens) != self.depth:
+            raise ValueError(
+                f"Expected {self.depth} per-layer prefix entries, got {len(layer_prefix_tokens)}."
+            )
+
+        for layer_idx, block in enumerate(self.net):
+            prefix_tokens = None if layer_prefix_tokens is None else layer_prefix_tokens[layer_idx]
+            prefix_len = 0
+
+            if prefix_tokens is not None:
+                if prefix_tokens.dim() == 2:
+                    prefix_tokens = prefix_tokens.unsqueeze(1)
+                if prefix_tokens.dim() != 3:
+                    raise ValueError(
+                        f"prefix_tokens must have shape [B, P, D], got {tuple(prefix_tokens.shape)}"
+                    )
+                if prefix_tokens.shape[0] != x.shape[0]:
+                    raise ValueError(
+                        f"prefix_tokens batch size {prefix_tokens.shape[0]} does not match input batch size {x.shape[0]}"
+                    )
+                if prefix_tokens.shape[-1] != x.shape[-1]:
+                    raise ValueError(
+                        f"prefix_tokens dim {prefix_tokens.shape[-1]} does not match embed dim {x.shape[-1]}"
+                    )
+                prefix_tokens = prefix_tokens.to(device=x.device, dtype=x.dtype)
+                prefix_len = int(prefix_tokens.shape[1])
+                x = torch.cat([prefix_tokens, x], dim=1)
+
+            x = block(x)
+            if prefix_len > 0:
+                x = x[:, prefix_len:, :]
+
         return self.norm(x)
 
 

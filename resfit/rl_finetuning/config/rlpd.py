@@ -23,6 +23,75 @@ class VitEncoderConfig:
 
 
 @dataclass
+class DepthAnythingV2ConditioningConfig:
+    enabled: bool = False
+    encoder: str = "vits"
+    source_root: str | None = None
+    weights: str | None = None
+    freeze_encoder: bool = True
+    num_intermediate_layers: int = 1
+    feature_layer: int = -1
+    # 0 means "condition every MinViT block".
+    num_conditioned_layers: int = 0
+    # Keep 0 to reuse the RL image resolution as-is.
+    resize_to: int = 0
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+    def __post_init__(self):
+        assert self.encoder in ["vits", "vitb", "vitl"], f"Unknown DepthAnythingV2 encoder {self.encoder!r}"
+        assert self.num_intermediate_layers >= 1, "num_intermediate_layers must be >= 1"
+        assert self.num_conditioned_layers >= 0, "num_conditioned_layers must be >= 0"
+        assert self.resize_to >= 0, "resize_to must be >= 0"
+
+
+@dataclass
+class MacroLocalDepthGatingConfig:
+    enabled: bool = False
+    camera_key: str = "observation.images.agentview"
+    neighborhood_radius: int = 1
+    gate_hidden_dim: int = 256
+    alpha_min: float = 0.75
+    alpha_max: float = 1.25
+    init_logit_bias: float = 0.0
+    scale_std_with_alpha: bool = False
+    alpha_l2_reg_weight: float = 0.0
+    use_base_action_step: bool = True
+    use_global_depth_cls: bool = True
+    eef_pos_indices: tuple[int, int, int] = (0, 1, 2)
+    action_pos_indices: tuple[int, int, int] = (0, 1, 2)
+    fixed_camera_only: bool = True
+    use_local_token_fusion: bool = False
+    local_token_dim: int = 256
+    local_token_num_heads: int = 4
+    local_token_num_layers: int = 2
+    local_token_ffn_dim: int = 512
+    local_token_dropout: float = 0.0
+    local_token_summary_init_scale: float = 0.0
+    fuse_to_critic: bool = True
+    critic_fusion_dim: int = 128
+    critic_use_global_depth_cls: bool = True
+    critic_detach_depth: bool = True
+    critic_fusion_init_scale: float = 0.0
+
+    def __post_init__(self):
+        assert self.neighborhood_radius >= 0, "neighborhood_radius must be >= 0"
+        assert self.gate_hidden_dim > 0, "gate_hidden_dim must be > 0"
+        assert self.alpha_min <= self.alpha_max, "alpha_min must be <= alpha_max"
+        assert self.alpha_l2_reg_weight >= 0.0, "alpha_l2_reg_weight must be >= 0"
+        assert len(self.eef_pos_indices) == 3, "eef_pos_indices must contain 3 entries"
+        assert len(self.action_pos_indices) == 3, "action_pos_indices must contain 3 entries"
+        assert self.local_token_dim > 0, "local_token_dim must be > 0"
+        assert self.local_token_num_heads > 0, "local_token_num_heads must be > 0"
+        assert self.local_token_dim % self.local_token_num_heads == 0, (
+            "local_token_dim must be divisible by local_token_num_heads"
+        )
+        assert self.local_token_num_layers >= 0, "local_token_num_layers must be >= 0"
+        assert self.local_token_ffn_dim > 0, "local_token_ffn_dim must be > 0"
+        assert self.critic_fusion_dim > 0, "critic_fusion_dim must be > 0"
+
+
+@dataclass
 class CriticLossCfg:
     type: str = "mse"
     n_bins: int = 51  # 0.995 γ → δ=0.005  # noqa: RUF003
@@ -106,7 +175,24 @@ class QAgentConfig:
     # encoder
     use_prop: int = 1
     enc_type: str = "vit"
+    use_groot_features: bool = False
+    groot_feature_key: str = "observation.groot_features"
+    groot_token_count: int = 0
+    groot_token_dim: int = 0
+    # Optional adapter for high-dimensional GR00T hidden tokens. Disabled by
+    # default for backwards compatibility; set project_dim > 0 to enable.
+    groot_feature_project_dim: int = 0
+    groot_feature_layer_norm: bool = True
+    groot_feature_dropout: float = 0.0
+    groot_feature_scale_init: float = 1.0
+    groot_feature_scale_learnable: bool = False
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
+    depth_anything_v2_conditioning: DepthAnythingV2ConditioningConfig = field(
+        default_factory=lambda: DepthAnythingV2ConditioningConfig()
+    )
+    macro_local_depth_gating: MacroLocalDepthGatingConfig = field(
+        default_factory=lambda: MacroLocalDepthGatingConfig()
+    )
     # critic & actor
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
@@ -260,6 +346,11 @@ class RLPDDexmgConfig:
     eval_num_episodes: int = 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
+    # Observation render size used by the residual RL policy. Leave unset to
+    # keep legacy 84px observations, except GR00T residual runs which use
+    # auto_groot_camera_size.
+    camera_size: int | None = None
+    auto_groot_camera_size: int = 224
     rl_camera: list[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",

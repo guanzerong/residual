@@ -40,6 +40,11 @@ class BasePolicyVecEnvWrapper:
         base_policy: ACTPolicy,
         action_scaler,
         state_standardizer,
+        macro_action_horizon: int = 1,
+        macro_discount_gamma: float = 0.99,
+        adaptive_horizons: tuple[int, ...] | None = None,
+        include_base_observation_features: bool = False,
+        base_observation_feature_key: str = "observation.groot_features",
     ):
         """
         Args:
@@ -55,12 +60,50 @@ class BasePolicyVecEnvWrapper:
         self.base_policy = base_policy
         self.action_scaler = action_scaler
         self.state_standardizer = state_standardizer
+        self.macro_action_horizon = int(macro_action_horizon)
+        self.macro_discount_gamma = float(macro_discount_gamma)
+        self.adaptive_horizons = tuple(sorted(adaptive_horizons or ()))
+        self.num_adaptive_horizons = len(self.adaptive_horizons)
+        self.include_base_observation_features = bool(include_base_observation_features)
+        self.base_observation_feature_key = str(base_observation_feature_key)
+
+        if self.macro_action_horizon < 1:
+            raise ValueError(f"macro_action_horizon must be >= 1, got {self.macro_action_horizon}")
 
         # Get action dimension from the environment
-        self.action_dim = vec_env.action_space.shape[-1]
+        self.primitive_action_dim = vec_env.action_space.shape[-1]
+        self.macro_action_enabled = self.macro_action_horizon > 1
+        self.base_action_dim = self.primitive_action_dim * self.macro_action_horizon
+        self.adaptive_horizon_enabled = self.macro_action_enabled and self.num_adaptive_horizons > 0
+        self.action_dim = self.base_action_dim + self.num_adaptive_horizons if self.adaptive_horizon_enabled else self.base_action_dim
+
+        if self.macro_action_enabled:
+            if vec_env.num_envs != 1:
+                raise ValueError("Macro residual actions currently only support num_envs == 1.")
+            if self.macro_action_horizon > base_policy.config.n_action_steps:
+                raise ValueError(
+                    "macro_action_horizon exceeds the base policy executable horizon. "
+                    f"Requested {self.macro_action_horizon}, but ACT exposes {base_policy.config.n_action_steps} steps."
+                )
+        if self.adaptive_horizon_enabled:
+            if self.adaptive_horizons[-1] != self.macro_action_horizon:
+                raise ValueError(
+                    "adaptive_horizons must end at macro_action_horizon. "
+                    f"Got adaptive_horizons={self.adaptive_horizons}, macro_action_horizon={self.macro_action_horizon}."
+                )
+            if self.adaptive_horizons[0] < 1:
+                raise ValueError(f"Adaptive horizons must be >= 1, got {self.adaptive_horizons}.")
 
         # Store image keys from base policy config
         self.image_keys = list(base_policy.config.image_features.keys())
+        self.base_observation_feature_shape: tuple[int, ...] | None = None
+        if self.include_base_observation_features:
+            if not hasattr(base_policy, "encode_observation_features"):
+                raise ValueError("include_base_observation_features=True requires base_policy.encode_observation_features().")
+            feature_shape = getattr(base_policy, "observation_feature_shape", None)
+            if feature_shape is None:
+                raise ValueError("Base policy must expose observation_feature_shape when caching observation features.")
+            self.base_observation_feature_shape = tuple(int(dim) for dim in feature_shape)
 
         # Create modified observation space that includes base actions
         self._setup_observation_space()
@@ -71,8 +114,16 @@ class BasePolicyVecEnvWrapper:
         # Get original observation space
         orig_obs_space = self.vec_env.observation_space
 
-        # Copy the action space
-        self.action_space = self.vec_env.action_space
+        # Copy the action space unless macro actions expand the residual dimension
+        if self.macro_action_enabled:
+            self.action_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(self.vec_env.num_envs, self.action_dim),
+                dtype=np.float32,
+            )
+        else:
+            self.action_space = self.vec_env.action_space
 
         # Create new observation space with augmented state
         obs_spaces = {}
@@ -87,6 +138,15 @@ class BasePolicyVecEnvWrapper:
                 # Keep other observations unchanged
                 obs_spaces[key] = space
 
+        if self.include_base_observation_features:
+            assert self.base_observation_feature_shape is not None
+            obs_spaces[self.base_observation_feature_key] = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(self.vec_env.num_envs, *self.base_observation_feature_shape),
+                dtype=np.float32,
+            )
+
         self.observation_space = gym.spaces.Dict(obs_spaces)
 
     def reset(self, **kwargs) -> tuple[dict[str, torch.Tensor], dict]:
@@ -98,10 +158,7 @@ class BasePolicyVecEnvWrapper:
         self.base_policy.reset()
 
         # Get base action from the base policy
-        with torch.no_grad():
-            base_action = self.base_policy.select_action(raw_obs)
-
-        base_naction = self.action_scaler.scale(base_action)
+        base_naction = self._compute_base_naction(raw_obs)
 
         # Augment observations with base action and apply state standardization
         augmented_obs = self._augment_obs(raw_obs, base_naction)
@@ -127,6 +184,13 @@ class BasePolicyVecEnvWrapper:
             truncated: Truncated tensor
             info: Info dict
         """
+        if self.macro_action_enabled:
+            return self._step_macro(residual_naction)
+        return self._step_single(residual_naction)
+
+    def _step_single(
+        self, residual_naction: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         # Combine base and residual actions
         # Residual action is already scaled inside the Actor class
         # To ensure that we can use the same exploration for all dimensions,
@@ -167,15 +231,130 @@ class BasePolicyVecEnvWrapper:
 
         return augmented_obs, reward, terminated, truncated, info
 
+    def _step_macro(
+        self, residual_naction: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        if residual_naction.dim() == 1:
+            residual_naction = residual_naction.unsqueeze(0)
+
+        batch_size = residual_naction.shape[0]
+        chosen_horizon = self.macro_action_horizon
+        horizon_onehot = None
+        if self.adaptive_horizon_enabled:
+            residual_chunk = residual_naction[:, : self.base_action_dim]
+            horizon_logits = residual_naction[:, self.base_action_dim :]
+            horizon_idx = torch.argmax(horizon_logits, dim=-1)
+            horizon_onehot = torch.nn.functional.one_hot(horizon_idx, num_classes=self.num_adaptive_horizons).to(
+                residual_naction.dtype
+            )
+            chosen_horizon = int(self.adaptive_horizons[int(horizon_idx[0].item())])
+            residual_naction = residual_chunk
+
+        combined_naction = self._last_base_naction + residual_naction
+        combined_chunk = combined_naction.view(batch_size, self.macro_action_horizon, self.primitive_action_dim)
+        env_action_chunk = self.action_scaler.unscale(combined_chunk)
+
+        discounted_reward = torch.zeros(batch_size, device=combined_naction.device, dtype=torch.float32)
+        undiscounted_reward = torch.zeros_like(discounted_reward)
+        primitive_steps = torch.zeros(batch_size, device=combined_naction.device, dtype=torch.long)
+        executed_chunk = torch.zeros_like(combined_chunk)
+
+        terminated = torch.zeros(batch_size, device=combined_naction.device, dtype=torch.bool)
+        truncated = torch.zeros_like(terminated)
+        macro_success = torch.zeros_like(terminated)
+
+        raw_obs = None
+        info: dict = {}
+
+        for step_idx in range(chosen_horizon):
+            env_action = env_action_chunk[:, step_idx]
+            raw_obs, reward, terminated, truncated, info = self.vec_env.step(env_action)
+
+            discounted_reward += (self.macro_discount_gamma**step_idx) * reward
+            undiscounted_reward += reward
+            primitive_steps += 1
+            executed_chunk[:, step_idx] = combined_chunk[:, step_idx]
+
+            done = terminated | truncated
+            if done.any():
+                macro_success = macro_success | terminated
+                reset_ids = torch.where(done)[0]
+                self.base_policy.reset(env_ids=reset_ids)
+                break
+
+        if raw_obs is None:
+            raise RuntimeError("Macro residual wrapper failed to execute any primitive environment step.")
+
+        base_naction = self._compute_base_naction(raw_obs)
+        augmented_obs = self._augment_obs(raw_obs, base_naction)
+
+        padded_action = executed_chunk.reshape(batch_size, -1)
+        if horizon_onehot is not None:
+            padded_action = torch.cat([padded_action, horizon_onehot], dim=-1)
+        info["scaled_action"] = padded_action
+        info["primitive_steps"] = primitive_steps
+        info["macro_success"] = macro_success
+        info["undiscounted_reward"] = undiscounted_reward
+        if self.adaptive_horizon_enabled:
+            info["chosen_horizon"] = torch.full(
+                (batch_size,), chosen_horizon, device=combined_naction.device, dtype=torch.long
+            )
+            info["executed_horizon"] = primitive_steps.clone()
+            info["gamma"] = torch.pow(
+                torch.full((batch_size,), self.macro_discount_gamma, device=combined_naction.device, dtype=torch.float32),
+                primitive_steps.float(),
+            )
+            info["nonterminal"] = ~(terminated | truncated)
+
+        if "final_obs" in info:
+            info = self._process_final_obs_in_info(info, combined_naction.device)
+
+        self._last_base_naction = base_naction
+
+        return augmented_obs, discounted_reward, terminated, truncated, info
+
+    def _compute_base_naction(self, raw_obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        with torch.no_grad():
+            if self.macro_action_enabled:
+                base_action = self.base_policy.select_action_chunk(
+                    raw_obs,
+                    n_action_steps=self.macro_action_horizon,
+                )
+                return self.action_scaler.scale(base_action).reshape(base_action.shape[0], -1)
+
+            base_action = self.base_policy.select_action(raw_obs)
+            return self.action_scaler.scale(base_action)
+
     def _augment_obs(self, raw_obs: dict[str, torch.Tensor], base_naction: torch.Tensor) -> dict[str, torch.Tensor]:
         """Augment observations with base actions."""
 
         # New way to do this is to just add the base action to the state under its own key
         augmented_obs = raw_obs.copy()
+        if self.include_base_observation_features:
+            augmented_obs[self.base_observation_feature_key] = self._compute_base_observation_features(raw_obs)
         augmented_obs["observation.base_action"] = base_naction
         augmented_obs["observation.state"] = self.state_standardizer.standardize(augmented_obs["observation.state"])
 
         return augmented_obs
+
+    def _base_policy_obs_batch(self, raw_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        batch = {"observation.state": raw_obs["observation.state"]}
+        for key in self.image_keys:
+            batch[key] = raw_obs[key]
+
+        for key, value in list(batch.items()):
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value)
+            if key == "observation.state" and value.dim() == 1:
+                value = value.unsqueeze(0)
+            elif key in self.image_keys and value.dim() == 3:
+                value = value.unsqueeze(0)
+            batch[key] = value
+        return batch
+
+    def _compute_base_observation_features(self, raw_obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        with torch.no_grad():
+            return self.base_policy.encode_observation_features(self._base_policy_obs_batch(raw_obs)).detach()
 
     def _process_final_obs_in_info(self, info: dict, device: torch.device) -> dict:
         """Pad final_obs state with zeros to match augmented observation format."""
@@ -184,9 +363,15 @@ class BasePolicyVecEnvWrapper:
 
         for final_obs_dict in info["final_obs"]:
             if final_obs_dict is not None and "observation.state" in final_obs_dict:
+                if self.include_base_observation_features:
+                    features = self._compute_base_observation_features(final_obs_dict)
+                    final_obs_dict[self.base_observation_feature_key] = features.squeeze(0).to(device)
                 # Pad with zeros (no action taken at terminal state)
                 final_obs_dict["observation.base_action"] = torch.zeros(
-                    self.action_dim, device=device, dtype=torch.float32
+                    self.base_action_dim, device=device, dtype=torch.float32
+                )
+                final_obs_dict["observation.state"] = self.state_standardizer.standardize(
+                    torch.as_tensor(final_obs_dict["observation.state"], device=device)
                 )
 
         return info

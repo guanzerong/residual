@@ -53,6 +53,8 @@ ENV_ROBOTS = {
     "PickPlaceCan": ["Panda"],
     # Square task -- implemented in robosuite as `NutAssemblySquare`
     "NutAssemblySquare": ["Panda"],
+    # ToolHang task -- single Panda arm
+    "ToolHang": ["Panda"],
 }
 # Create a named logger
 logger = logging.getLogger(__name__)
@@ -102,6 +104,10 @@ class RobosuiteGymWrapper:
             # "Transport" and things will work out of the box.
             "Can": "PickPlaceCan",
             "Square": "NutAssemblySquare",
+            "ToolHang": "ToolHang",
+            "toolhang": "ToolHang",
+            "Tool_Hang": "ToolHang",
+            "tool_hang": "ToolHang",
             "Transport": "TwoArmTransport",
         }
 
@@ -131,6 +137,7 @@ class RobosuiteGymWrapper:
             "Lift": 100,
             "PickPlaceCan": 200,
             "NutAssemblySquare": 300,
+            "ToolHang": 700,
             "Threading": 500,
             "TwoArmTransport": 800,
             "TwoArmBoxCleanup": 300,
@@ -394,6 +401,11 @@ class RobosuiteGymWrapper:
             "robot0_eye_in_hand_image",
         ]
 
+        panda_toolhang_image_keys = [
+            "sideview_image",
+            "robot0_eye_in_hand_image",
+        ]
+
         panda_image_keys_multi = [
             "agentview_image",
             "robot0_eye_in_hand_image",
@@ -431,6 +443,9 @@ class RobosuiteGymWrapper:
             return humanoid_can_sort_image_keys
         if any(task in env_lower for task in ["pouring", "coffee"]):
             return humanoid_image_keys
+
+        if "toolhang" in env_lower or "tool_hang" in env_lower:
+            return panda_toolhang_image_keys
 
         # Single-arm Panda tasks (Lift, Can, Square, Threading, etc.) --------
         if env_lower in {"lift", "can", "pickplacecan", "square", "nutassemblysquare", "threading"}:
@@ -535,6 +550,33 @@ class RobosuiteGymWrapper:
         it is not a `gym.Wrapper`.
         """
         setattr(self, name, value)
+
+    def get_stage_metrics(self) -> dict[str, float]:
+        """Expose task-stage metrics for evaluation-time logging.
+
+        The returned values are intentionally lightweight, numeric scalars so they can
+        be safely called from vectorized workers and serialized into W&B / CSV traces.
+        """
+        metrics: dict[str, float] = {}
+
+        if hasattr(self.env, "staged_rewards"):
+            stage_values = self.env.staged_rewards()
+            if isinstance(stage_values, (list, tuple)):
+                if "NutAssembly" in self.env_name:
+                    stage_names = ("reach", "grasp", "lift", "align")
+                else:
+                    stage_names = tuple(f"stage_{idx}" for idx in range(len(stage_values)))
+
+                for stage_name, stage_value in zip(stage_names, stage_values):
+                    metrics[f"stage/{stage_name}"] = float(stage_value)
+
+        if hasattr(self.env, "objects_on_pegs"):
+            metrics["task/objects_on_pegs"] = float(np.sum(self.env.objects_on_pegs))
+
+        if hasattr(self.env, "_check_success"):
+            metrics["task/is_success_state"] = float(bool(self.env._check_success()))
+
+        return metrics
 
 
 def make_dexmimicgen_env(

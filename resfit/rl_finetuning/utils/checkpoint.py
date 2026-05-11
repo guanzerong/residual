@@ -99,8 +99,9 @@ def save_checkpoint(
     optimizer_state_dict = {
         "actor_opt": agent.actor_opt.state_dict(),
         "critic_opt": agent.critic_opt.state_dict(),
-        "encoder_opt": agent.encoder_opt.state_dict(),
     }
+    if getattr(agent, "encoder_opt", None) is not None:
+        optimizer_state_dict["encoder_opt"] = agent.encoder_opt.state_dict()
     scheduler_state_dict = {}
     if hasattr(agent, "actor_scheduler") and agent.actor_scheduler is not None:
         scheduler_state_dict["actor_scheduler"] = agent.actor_scheduler.state_dict()

@@ -151,6 +151,49 @@ class ACTPolicy(PreTrainedPolicy):
         if len(self._temporal_ensemblers) > batch_size:
             self._temporal_ensemblers = self._temporal_ensemblers[:batch_size]
 
+    def _prepare_action_inference_batch(self, batch: dict[str, Tensor]) -> tuple[dict[str, Tensor], int]:
+        """Normalize inputs and infer the batch size for action inference."""
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch["observation.images"] = [batch[key] for key in self.config.image_features]
+
+        batch_size = None
+        for v in batch.values():
+            if isinstance(v, torch.Tensor):
+                batch_size = v.shape[0]
+                break
+        if batch_size is None:
+            raise ValueError("Could not determine batch size from input batch dictionary.")
+
+        return batch, batch_size
+
+    def _predict_action_sequence(self, batch: dict[str, Tensor], n_action_steps: int | None = None) -> Tensor:
+        """Run the ACT model once and return an action chunk without touching the execution queues."""
+        batch, _ = self._prepare_action_inference_batch(batch)
+        actions_seq = self.model(batch)[0]
+        if n_action_steps is not None:
+            if n_action_steps <= 0:
+                raise ValueError(f"n_action_steps must be > 0, got {n_action_steps}")
+            if n_action_steps > self.config.n_action_steps:
+                raise ValueError(
+                    f"Requested action chunk of length {n_action_steps}, "
+                    f"but ACT policy only predicts {self.config.n_action_steps} executable steps."
+                )
+            actions_seq = actions_seq[:, :n_action_steps]
+        else:
+            actions_seq = actions_seq[:, : self.config.n_action_steps]
+
+        return self.unnormalize_outputs({"action": actions_seq})["action"]
+
+    @torch.no_grad
+    def select_action_chunk(self, batch: dict[str, Tensor], n_action_steps: int | None = None) -> Tensor:
+        """Return a future action chunk directly from the policy without mutating internal action queues."""
+        self.eval()
+        if self.config.temporal_ensemble_coeff is not None:
+            raise RuntimeError("select_action_chunk is not supported when temporal ensembling is enabled.")
+        return self._predict_action_sequence(batch, n_action_steps=n_action_steps)
+
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -160,22 +203,7 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()
-
-        batch = self.normalize_inputs(batch)
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = [batch[key] for key in self.config.image_features]
-
-        # Pick any tensor in the batch dictionary to determine the batch dimension. Some entries
-        # (e.g. "observation.images") are *lists* of tensors, so we skip those.
-        batch_size = None
-        for v in batch.values():
-            if isinstance(v, torch.Tensor):
-                batch_size = v.shape[0]
-                break
-        if batch_size is None:
-            # Should never happen- at least one tensor is expected in every batch.
-            raise ValueError("Could not determine batch size from input batch dictionary.")
+        batch, batch_size = self._prepare_action_inference_batch(batch)
 
         # ------------------------------------------------------------------
         # Case 1: temporal ensembling (n_action_steps must be 1 in this mode)
@@ -206,8 +234,7 @@ class ACTPolicy(PreTrainedPolicy):
         if envs_needing_chunk:
             # Forward the entire batch once- cheaper than slicing inputs multiple times.
             # We only *use* the chunks for envs with empty queues.
-            actions_seq = self.model(batch)[0][:, : self.config.n_action_steps]  # (B, n_steps, act_dim)
-            actions_seq = self.unnormalize_outputs({"action": actions_seq})["action"]
+            actions_seq = self._predict_action_sequence(batch, n_action_steps=self.config.n_action_steps)
 
             # Fill the empty queues.
             for idx in envs_needing_chunk:
