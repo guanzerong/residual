@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from pathlib import Path
 
 import imageio
@@ -143,12 +146,33 @@ def run_dexmg_evaluation(
     # ------------------------------------------------------------------
     device = torch.device(device)
     agent.eval()
+    agent.reset_runtime_stats()
+    agent.set_runtime_profiling(True)
+
+    def _sync_cuda() -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def _latency_stats(prefix: str, samples_ms: list[float]) -> dict[str, float]:
+        if not samples_ms:
+            return {
+                f"eval/{prefix}_mean_ms": 0.0,
+                f"eval/{prefix}_p50_ms": 0.0,
+                f"eval/{prefix}_p95_ms": 0.0,
+            }
+        values = np.asarray(samples_ms, dtype=np.float64)
+        return {
+            f"eval/{prefix}_mean_ms": float(values.mean()),
+            f"eval/{prefix}_p50_ms": float(np.percentile(values, 50)),
+            f"eval/{prefix}_p95_ms": float(np.percentile(values, 95)),
+        }
 
     num_envs: int = env.num_envs if hasattr(env, "num_envs") else 1
 
     # Per-environment episode buffers ----------------------------------
     ep_rewards: list[list[float]] = [[] for _ in range(num_envs)]
     ep_q_preds: list[list[float]] = [[] for _ in range(num_envs)]
+    ep_primitive_steps: list[int] = [0 for _ in range(num_envs)]
 
     successes: list[bool] = []  # episode-level success flags
     returns: list[float] = []  # episode-level undiscounted returns
@@ -156,12 +180,24 @@ def run_dexmg_evaluation(
     # Q-trajectory data for plotting ------------------------------------
     all_q_trajectories: list[list[float]] = []  # Store Q-trajectories for all episodes
     all_episode_lengths: list[int] = []  # Store episode lengths for plotting
+    all_episode_primitive_lengths: list[int] = []
+    policy_latency_ms: list[float] = []
+    env_step_latency_ms: list[float] = []
+    residual_l1_values: list[float] = []
+    residual_l2_values: list[float] = []
+    policy_depth_refreshes = 0
+    residual_decisions = 0
+    total_primitive_steps = 0
+    chosen_horizon_counts: dict[int, int] = {}
 
     # Video buffers -----------------------------------------------------
     frame_buffer: list[list[np.ndarray]] | None = [[] for _ in range(num_envs)] if save_video else None
     all_frames: list[np.ndarray] | None = [] if save_video else None
 
     done_episodes = 0
+    reset_runtime_stats = getattr(env, "reset_runtime_stats", None)
+    if callable(reset_runtime_stats):
+        reset_runtime_stats()
     obs, _ = env.reset()
 
     # Initialize progress display with dots
@@ -175,6 +211,16 @@ def run_dexmg_evaluation(
         with torch.no_grad():
             # Build features on-the-fly to obtain Q-predictions --------
             obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
+            depth_cache_keys: list[str] = []
+            if agent.uses_depth_patch_state:
+                depth_cache_keys.extend(agent.get_depth_patch_cache_keys())
+            if agent.uses_depth_anything_v2_conditioning:
+                depth_cache_keys.extend(agent.get_depth_cache_keys())
+            if depth_cache_keys and not all(key in obs_q for key in depth_cache_keys):
+                policy_depth_refreshes += 1
+
+            _sync_cuda()
+            policy_start = time.perf_counter()
             obs_q["feat"] = agent._encode(obs_q, augment=False)
             policy_output = agent._forward_actor_policy(obs_q, stddev=0.0, use_target=False)
             residual_action = agent._sample_action_from_policy_output(policy_output, eval_mode=True, clip=None)
@@ -186,14 +232,44 @@ def run_dexmg_evaluation(
                 horizon_onehot, _ = agent._sample_horizon_onehot(policy_output.horizon_logits, eval_mode=True)
 
             actions = agent._build_env_action(residual_action, horizon_onehot)
+            selected_residual = (
+                agent._select_residual_candidate(residual_action, horizon_onehot)
+                if agent.uses_adaptive_horizons
+                else residual_action
+            )
+            _sync_cuda()
+            policy_latency_ms.append((time.perf_counter() - policy_start) * 1000.0)
+            residual_decisions += 1
+            residual_l1_values.append(float(selected_residual.abs().mean().item()))
+            residual_l2_values.append(float(selected_residual.square().mean().item()))
+
             q_actions = agent._build_critic_actions(obs_q, residual_action, horizon_onehot=horizon_onehot)
             q_pred = agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)
 
         # --------------------------------------------------------------
         # 2. Environment step ------------------------------------------
         # --------------------------------------------------------------
+        _sync_cuda()
+        env_step_start = time.perf_counter()
         next_obs, reward, terminated, truncated, info = env.step(actions)
+        _sync_cuda()
+        env_step_latency_ms.append((time.perf_counter() - env_step_start) * 1000.0)
         done_flags = terminated | truncated
+        primitive_steps_info = info.get("primitive_steps")
+        if primitive_steps_info is None:
+            primitive_steps_by_env = [1 for _ in range(num_envs)]
+        elif isinstance(primitive_steps_info, torch.Tensor):
+            primitive_steps_by_env = [int(value) for value in primitive_steps_info.detach().cpu().tolist()]
+        else:
+            primitive_steps_by_env = [int(value) for value in np.asarray(primitive_steps_info).tolist()]
+        total_primitive_steps += sum(primitive_steps_by_env)
+
+        if "chosen_horizon" in info:
+            selected = info["chosen_horizon"]
+            selected_values = selected.detach().cpu().tolist() if isinstance(selected, torch.Tensor) else selected
+            for horizon in selected_values:
+                horizon = int(horizon)
+                chosen_horizon_counts[horizon] = chosen_horizon_counts.get(horizon, 0) + 1
 
         # Capture frames ------------------------------------------------
         if save_video and frame_buffer is not None:
@@ -205,6 +281,7 @@ def run_dexmg_evaluation(
         # 3. Per-environment bookkeeping -------------------------------
         # --------------------------------------------------------------
         for env_idx in range(num_envs):
+            ep_primitive_steps[env_idx] += primitive_steps_by_env[env_idx]
             if "undiscounted_reward" in info:
                 ep_rewards[env_idx].append(info["undiscounted_reward"][env_idx].item())
             else:
@@ -232,6 +309,7 @@ def run_dexmg_evaluation(
 
                 # Always track episode length for successful episodes logging
                 all_episode_lengths.append(len(ep_q_preds[env_idx]))
+                all_episode_primitive_lengths.append(ep_primitive_steps[env_idx])
 
                 # Annotate and flush frames ---------------------------
                 if save_video and frame_buffer is not None and all_frames is not None:
@@ -258,6 +336,7 @@ def run_dexmg_evaluation(
                 # Reset per-env caches --------------------------------
                 ep_rewards[env_idx].clear()
                 ep_q_preds[env_idx].clear()
+                ep_primitive_steps[env_idx] = 0
 
                 done_episodes += 1
 
@@ -277,6 +356,11 @@ def run_dexmg_evaluation(
         raise RuntimeError(
             f"Episode length/success misalignment: lengths={len(all_episode_lengths)} successes={len(successes)}"
         )
+    if len(all_episode_primitive_lengths) != len(successes):
+        raise RuntimeError(
+            "Primitive episode length/success misalignment: "
+            f"lengths={len(all_episode_primitive_lengths)} successes={len(successes)}"
+        )
 
     success_rate: float = float(np.mean(successes)) if successes else 0.0
     mean_return: float = float(np.mean(returns)) if returns else 0.0
@@ -286,12 +370,91 @@ def run_dexmg_evaluation(
     mean_successful_episode_length: float = (
         float(np.mean(successful_episode_lengths)) if successful_episode_lengths else 0.0
     )
+    successful_primitive_lengths = [
+        length for length, is_success in zip(all_episode_primitive_lengths, successes, strict=True) if is_success
+    ]
+
+    runtime_stats_fn = getattr(env, "get_runtime_stats", None)
+    runtime_stats = runtime_stats_fn() if callable(runtime_stats_fn) else {}
+    agent_runtime_stats = agent.get_runtime_stats()
+    agent.set_runtime_profiling(False)
+    proposal_query_count = max(0.0, runtime_stats.get("proposal_query_count", 0.0) - 1.0)
+    proposal_depth_count = max(0.0, runtime_stats.get("proposal_depth_context_count", 0.0) - 1.0)
+    total_depth_refreshes = float(policy_depth_refreshes) + proposal_depth_count
+    completed_episodes = max(len(successes), 1)
+    raw_depth_forwards = agent_runtime_stats.get("depth_encoder_forward_count", 0.0)
+    extra_final_depth_forwards = 0
+    if runtime_stats.get("proposal_depth_context_count", 0.0) > 0:
+        if agent.uses_depth_patch_state:
+            extra_final_depth_forwards = len(agent.depth_patch_camera_keys)
+        elif agent.uses_depth_anything_v2_conditioning:
+            extra_final_depth_forwards = len(agent.rl_cameras)
+    used_depth_forwards = max(0.0, raw_depth_forwards - extra_final_depth_forwards)
 
     metrics: dict[str, float] = {
         "eval/success_rate": success_rate,
         "eval/mean_return": mean_return,
         "eval/mean_successful_episode_length": mean_successful_episode_length,
+        "eval/mean_episode_primitive_steps": float(np.mean(all_episode_primitive_lengths)),
+        "eval/mean_successful_episode_primitive_steps": (
+            float(np.mean(successful_primitive_lengths)) if successful_primitive_lengths else 0.0
+        ),
+        "eval/residual_decisions_per_episode": float(residual_decisions / completed_episodes),
+        "eval/proposal_queries_per_episode": float(proposal_query_count / completed_episodes),
+        "eval/depth_refreshes_per_episode": float(total_depth_refreshes / completed_episodes),
+        "eval/depth_encoder_forwards_per_episode": float(used_depth_forwards / completed_episodes),
+        "eval/residual_l1_mean": float(np.mean(residual_l1_values)) if residual_l1_values else 0.0,
+        "eval/residual_l2_mean": float(np.mean(residual_l2_values)) if residual_l2_values else 0.0,
+        "eval/control_cycle_ms_per_primitive_step": (
+            float((sum(policy_latency_ms) + sum(env_step_latency_ms)) / total_primitive_steps)
+            if total_primitive_steps
+            else 0.0
+        ),
     }
+    metrics.update(_latency_stats("policy_latency", policy_latency_ms))
+    metrics.update(_latency_stats("env_step_latency", env_step_latency_ms))
+    for runtime_name, value in runtime_stats.items():
+        metrics[f"eval/runtime_{runtime_name}"] = float(value)
+    for runtime_name, value in agent_runtime_stats.items():
+        metrics[f"eval/runtime_{runtime_name}"] = float(value)
+    if chosen_horizon_counts:
+        total_horizon_decisions = sum(chosen_horizon_counts.values())
+        metrics["eval/mean_selected_horizon"] = float(
+            sum(horizon * count for horizon, count in chosen_horizon_counts.items()) / total_horizon_decisions
+        )
+        for horizon, count in sorted(chosen_horizon_counts.items()):
+            metrics[f"eval/selected_horizon_fraction_{horizon}"] = float(count / total_horizon_decisions)
+
+    metrics_dir = os.environ.get("EVAL_METRICS_DIR")
+    if metrics_dir:
+        metrics_root = Path(metrics_dir).expanduser().resolve()
+        metrics_root.mkdir(parents=True, exist_ok=True)
+        safe_run_name = (run_name or "evaluation").replace("/", "_")
+        record = {
+            "run_name": run_name,
+            "global_step": global_step,
+            "num_episodes": len(successes),
+            "metrics": metrics,
+            "episodes": [
+                {
+                    "success": bool(success),
+                    "return": float(ep_return),
+                    "decision_steps": int(decision_steps),
+                    "primitive_steps": int(primitive_steps),
+                }
+                for success, ep_return, decision_steps, primitive_steps in zip(
+                    successes,
+                    returns,
+                    all_episode_lengths,
+                    all_episode_primitive_lengths,
+                    strict=True,
+                )
+            ],
+            "chosen_horizon_counts": chosen_horizon_counts,
+            "recorded_at_unix_s": time.time(),
+        }
+        with (metrics_root / f"{safe_run_name}.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     if wandb.run is not None:
         wandb.log(metrics, step=global_step)

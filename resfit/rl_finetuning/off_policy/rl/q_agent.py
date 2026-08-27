@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from contextlib import contextmanager
 
 import torch
@@ -34,6 +35,7 @@ class QAgent(nn.Module):
         base_action_dim: int | None = None,
         primitive_action_dim: int | None = None,
         adaptive_horizons: tuple[int, ...] | None = None,
+        adaptive_residual_mode: str = "shared_prefix",
         adaptive_horizon_entropy_reg: float = 0.0,
         task_name: str | None = None,
         action_scaler_min: torch.Tensor | None = None,
@@ -70,8 +72,13 @@ class QAgent(nn.Module):
         self.rl_cameras = rl_cameras
         self.cfg = cfg
         self.residual_actor = residual_actor
+        self._runtime_profiling = False
+        self.reset_runtime_stats()
         self.use_residual_image_encoder = bool(getattr(self.cfg, "use_residual_image_encoder", True))
-        self.uses_base_act_encoder_state = bool(getattr(self.cfg, "use_base_act_encoder_state", False))
+        self.uses_base_act_encoder_state = bool(
+            getattr(self.cfg, "use_base_act_encoder_state", False)
+            or getattr(self.cfg, "use_base_policy_encoder_state", False)
+        )
         self.state_mean = None if state_mean is None else state_mean.detach().cpu().float()
         self.state_std = None if state_std is None else state_std.detach().cpu().float()
         self.critic_action_dim = int(action_dim)
@@ -86,6 +93,14 @@ class QAgent(nn.Module):
         self.adaptive_horizons = tuple(sorted(adaptive_horizons or ()))
         self.num_adaptive_horizons = len(self.adaptive_horizons)
         self.uses_adaptive_horizons = self.num_adaptive_horizons > 0
+        self.adaptive_residual_mode = str(adaptive_residual_mode)
+        if self.adaptive_residual_mode not in {"shared_prefix", "horizon_conditioned"}:
+            raise ValueError(
+                "adaptive_residual_mode must be 'shared_prefix' or 'horizon_conditioned', "
+                f"got {self.adaptive_residual_mode!r}"
+            )
+        if self.adaptive_residual_mode == "horizon_conditioned" and not self.uses_adaptive_horizons:
+            raise ValueError("horizon_conditioned residuals require adaptive horizons.")
         self.adaptive_horizon_entropy_reg = float(adaptive_horizon_entropy_reg)
         self.max_action_horizon = max(self.adaptive_horizons) if self.adaptive_horizons else 1
         if self.uses_adaptive_horizons:
@@ -340,6 +355,7 @@ class QAgent(nn.Module):
             cfg.actor,
             residual_actor=residual_actor,
             horizon_choices=self.adaptive_horizons,
+            adaptive_residual_mode=self.adaptive_residual_mode,
         )
 
         self.critic_target = copy.deepcopy(self.critic)
@@ -736,25 +752,100 @@ class QAgent(nn.Module):
 
     def _combine_with_base_action(self, obs: dict[str, torch.Tensor], residual_action: torch.Tensor) -> torch.Tensor:
         if self.residual_actor:
-            return torch.clamp(obs["observation.base_action"] + residual_action, -1.0, 1.0)
+            base_action = obs["observation.base_action"]
+            if residual_action.dim() == 3:
+                base_action = base_action.unsqueeze(1)
+            return torch.clamp(base_action + residual_action, -1.0, 1.0)
         return residual_action
 
+    def _adaptive_prefix_mask(self, reference: torch.Tensor) -> torch.Tensor:
+        """Return the valid prefix mask as ``[1, K, base_action_dim]``."""
+        horizon_tensor = torch.as_tensor(
+            self.adaptive_horizons,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        step_indices = torch.arange(self.max_action_horizon, device=reference.device, dtype=torch.long)
+        step_mask = step_indices.unsqueeze(0) < horizon_tensor.unsqueeze(1)
+        return (
+            step_mask.to(dtype=reference.dtype)
+            .unsqueeze(-1)
+            .expand(-1, -1, self.primitive_action_dim)
+            .reshape(1, self.num_adaptive_horizons, self.base_action_dim)
+        )
+
+    def _candidate_residuals(self, residual_action: torch.Tensor) -> torch.Tensor:
+        """Normalize and prefix-mask candidate chunks to ``[B, K, D]``."""
+        if not self.uses_adaptive_horizons:
+            raise RuntimeError("Candidate residuals are only defined for adaptive horizons.")
+        if residual_action.dim() == 2:
+            if residual_action.shape[-1] != self.base_action_dim:
+                raise ValueError(
+                    "Expected flattened residual action with dimension "
+                    f"{self.base_action_dim}, got {tuple(residual_action.shape)}"
+                )
+            candidates = residual_action.unsqueeze(1).expand(-1, self.num_adaptive_horizons, -1)
+        elif residual_action.dim() == 3:
+            expected = (self.num_adaptive_horizons, self.base_action_dim)
+            if tuple(residual_action.shape[1:]) != expected:
+                raise ValueError(
+                    f"Expected horizon-conditioned residual shape [B, {expected[0]}, {expected[1]}], "
+                    f"got {tuple(residual_action.shape)}"
+                )
+            candidates = residual_action
+        else:
+            raise ValueError(f"Expected residual action rank 2 or 3, got shape {tuple(residual_action.shape)}")
+
+        # A candidate is responsible only for its executed prefix.  Keeping
+        # the padded suffix at zero also makes selected environment actions and
+        # diagnostics obey the same contract as critic/replay actions.
+        return candidates * self._adaptive_prefix_mask(candidates)
+
+    def _select_residual_candidate(
+        self,
+        residual_action: torch.Tensor,
+        horizon_onehot: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the residual corresponding to the selected horizon."""
+        candidates = self._candidate_residuals(residual_action)
+        horizon_index = torch.argmax(horizon_onehot, dim=-1)
+        batch_index = torch.arange(candidates.shape[0], device=candidates.device)
+        return candidates[batch_index, horizon_index]
+
     def _build_adaptive_critic_actions(self, combined_action: torch.Tensor) -> torch.Tensor:
-        batch_size = combined_action.shape[0]
-        combined_chunk = combined_action.view(batch_size, self.max_action_horizon, self.primitive_action_dim)
-        candidate_actions = []
-        for horizon_idx, horizon in enumerate(self.adaptive_horizons):
-            executed_chunk = torch.zeros_like(combined_chunk)
-            executed_chunk[:, :horizon] = combined_chunk[:, :horizon]
-            horizon_onehot = torch.zeros(
-                batch_size,
-                self.num_adaptive_horizons,
-                device=combined_action.device,
-                dtype=combined_action.dtype,
-            )
-            horizon_onehot[:, horizon_idx] = 1.0
-            candidate_actions.append(torch.cat([executed_chunk.reshape(batch_size, -1), horizon_onehot], dim=-1))
-        return torch.stack(candidate_actions, dim=1)
+        """Build masked critic actions for all candidate horizons.
+
+        ``combined_action`` may be one shared chunk ``[B, D]`` (SP) or one
+        chunk per horizon ``[B, K, D]`` (HC). The returned tensor is
+        ``[B, K, D + K]`` and keeps the existing replay/environment format.
+        """
+        if combined_action.dim() == 2:
+            candidate_combined = combined_action.unsqueeze(1).expand(-1, self.num_adaptive_horizons, -1)
+        elif combined_action.dim() == 3:
+            candidate_combined = self._candidate_residuals(combined_action)
+        else:
+            raise ValueError(f"Expected combined action rank 2 or 3, got {tuple(combined_action.shape)}")
+
+        batch_size = candidate_combined.shape[0]
+        combined_chunks = candidate_combined.reshape(
+            batch_size,
+            self.num_adaptive_horizons,
+            self.max_action_horizon,
+            self.primitive_action_dim,
+        )
+        prefix_mask = self._adaptive_prefix_mask(candidate_combined).reshape(
+            1,
+            self.num_adaptive_horizons,
+            self.max_action_horizon,
+            self.primitive_action_dim,
+        )
+        executed_chunks = combined_chunks * prefix_mask
+        onehot = torch.eye(
+            self.num_adaptive_horizons,
+            device=combined_action.device,
+            dtype=candidate_combined.dtype,
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+        return torch.cat([executed_chunks.reshape(batch_size, self.num_adaptive_horizons, -1), onehot], dim=-1)
 
     def _build_critic_actions(
         self,
@@ -779,7 +870,8 @@ class QAgent(nn.Module):
             return residual_action
         if horizon_onehot is None:
             raise ValueError("Adaptive horizon policies require a horizon_onehot when building env actions.")
-        return torch.cat([residual_action, horizon_onehot], dim=-1)
+        selected_residual = self._select_residual_candidate(residual_action, horizon_onehot)
+        return torch.cat([selected_residual, horizon_onehot], dim=-1)
 
     def _evaluate_critic_actions(
         self,
@@ -803,10 +895,20 @@ class QAgent(nn.Module):
         return q_values.reshape(batch_size, num_horizons)
 
     def _adaptive_prefix_l2_penalty(self, residual_action: torch.Tensor, horizon_probs: torch.Tensor) -> torch.Tensor:
-        residual_chunk = residual_action.view(residual_action.shape[0], self.max_action_horizon, self.primitive_action_dim)
-        per_step_sq = torch.sum(residual_chunk**2, dim=-1)
+        candidates = self._candidate_residuals(residual_action)
+        residual_chunks = candidates.view(
+            candidates.shape[0], self.num_adaptive_horizons, self.max_action_horizon, self.primitive_action_dim
+        )
+        per_step_sq = torch.sum(residual_chunks**2, dim=-1)
         prefix_sq = torch.cumsum(per_step_sq, dim=-1)
-        horizon_penalties = torch.stack([prefix_sq[:, horizon - 1] for horizon in self.adaptive_horizons], dim=-1)
+        horizon_indices = torch.as_tensor(self.adaptive_horizons, device=residual_action.device, dtype=torch.long) - 1
+        # Each candidate has its own prefix length.  Explicitly stack the
+        # diagonal entries instead of relying on advanced-indexing semantics,
+        # which differ subtly across torch versions.
+        horizon_penalties = torch.stack(
+            [prefix_sq[:, candidate_idx, horizon_idx] for candidate_idx, horizon_idx in enumerate(horizon_indices)],
+            dim=-1,
+        )
         expected_penalty = torch.sum(horizon_probs * horizon_penalties, dim=-1)
         return self.cfg.actor.action_l2_reg_weight * expected_penalty.mean()
 
@@ -920,7 +1022,10 @@ class QAgent(nn.Module):
         if "observation.state" not in obs_group:
             raise KeyError("Depth patch state requires observation.state in the observation dict.")
 
-        patch_tokens, _ = self.depth_patch_encoder.forward_patches_and_cls(image_batch, flatten_patches=False)
+        patch_tokens, _ = self._timed_depth_forward(
+            lambda: self.depth_patch_encoder.forward_patches_and_cls(image_batch, flatten_patches=False),
+            image_batch,
+        )
         preprocessed = self.depth_patch_encoder._preprocess(image_batch)
         proc_hw = (int(preprocessed.shape[-2]), int(preprocessed.shape[-1]))
         patch_rows = proc_hw[0] // int(self.depth_patch_encoder.patch_size)
@@ -1054,7 +1159,7 @@ class QAgent(nn.Module):
             group_batch_sizes.append(batch_size or 0)
 
         packed = torch.cat(packed_batches, dim=0)
-        packed_cls = self.depth_anything_v2_encoder.forward_cls(packed)
+        packed_cls = self._timed_depth_forward(lambda: self.depth_anything_v2_encoder.forward_cls(packed), packed)
 
         cls_groups: list[list[torch.Tensor]] = []
         offset = 0
@@ -1066,6 +1171,44 @@ class QAgent(nn.Module):
                 offset = next_offset
             cls_groups.append(cls_by_cam)
         return cls_groups
+
+    def _timed_depth_forward(self, fn, reference: torch.Tensor):
+        if not self._runtime_profiling:
+            return fn()
+        if reference.is_cuda:
+            torch.cuda.synchronize(reference.device)
+        start = time.perf_counter()
+        result = fn()
+        if reference.is_cuda:
+            torch.cuda.synchronize(reference.device)
+        duration = time.perf_counter() - start
+        self._runtime_depth_durations_s.append(duration)
+        return result
+
+    def set_runtime_profiling(self, enabled: bool) -> None:
+        self._runtime_profiling = bool(enabled)
+
+    def reset_runtime_stats(self) -> None:
+        self._runtime_depth_durations_s: list[float] = []
+
+    def get_runtime_stats(self) -> dict[str, float]:
+        durations = self._runtime_depth_durations_s
+        if not durations:
+            return {
+                "depth_encoder_forward_count": 0.0,
+                "depth_encoder_forward_total_s": 0.0,
+                "depth_encoder_forward_mean_ms": 0.0,
+                "depth_encoder_forward_p50_ms": 0.0,
+                "depth_encoder_forward_p95_ms": 0.0,
+            }
+        values = torch.tensor(durations, dtype=torch.float64)
+        return {
+            "depth_encoder_forward_count": float(len(durations)),
+            "depth_encoder_forward_total_s": float(values.sum().item()),
+            "depth_encoder_forward_mean_ms": float(values.mean().item() * 1000.0),
+            "depth_encoder_forward_p50_ms": float(torch.quantile(values, 0.50).item() * 1000.0),
+            "depth_encoder_forward_p95_ms": float(torch.quantile(values, 0.95).item() * 1000.0),
+        }
 
     def _encode_depth_patch_tokens(
         self,
@@ -1352,8 +1495,41 @@ class QAgent(nn.Module):
 
         return metrics
 
-    def _residual_l1_actor_penalty(self, residual_action: torch.Tensor):
-        residual_l1 = residual_action.abs().mean()
+    def _residual_l1_actor_penalty(
+        self,
+        residual_action: torch.Tensor,
+        horizon_probs: torch.Tensor | None = None,
+    ):
+        if self.uses_adaptive_horizons:
+            candidates = self._candidate_residuals(residual_action)
+            residual_chunks = candidates.view(
+                candidates.shape[0],
+                self.num_adaptive_horizons,
+                self.max_action_horizon,
+                self.primitive_action_dim,
+            )
+            per_step_l1 = residual_chunks.abs().mean(dim=-1)
+            prefix_l1 = torch.cumsum(per_step_l1, dim=-1)
+            horizon_indices = torch.as_tensor(
+                self.adaptive_horizons,
+                device=residual_action.device,
+                dtype=torch.long,
+            ) - 1
+            horizon_l1 = torch.stack(
+                [
+                    prefix_l1[:, candidate_idx, horizon_idx] / float(horizon)
+                    for candidate_idx, (horizon_idx, horizon) in enumerate(
+                        zip(horizon_indices, self.adaptive_horizons)
+                    )
+                ],
+                dim=-1,
+            )
+            if horizon_probs is None:
+                residual_l1 = horizon_l1.mean()
+            else:
+                residual_l1 = torch.sum(horizon_probs * horizon_l1, dim=-1).mean()
+        else:
+            residual_l1 = residual_action.abs().mean()
         coef = float(getattr(self.cfg, "residual_l1_penalty_coef", 0.0))
         target = float(getattr(self.cfg, "residual_l1_penalty_target", 0.0))
         if coef <= 0.0:
@@ -1365,12 +1541,15 @@ class QAgent(nn.Module):
 
         policy_output = self._forward_actor_policy(obs, 0.0, use_target=False)
         action_pred = self._sample_action_from_policy_output(policy_output, eval_mode=True, clip=self.cfg.stddev_clip)
-        residual_l1_penalty, residual_l1 = self._residual_l1_actor_penalty(action_pred)
-
+        horizon_probs = None
         if self.uses_adaptive_horizons:
             if policy_output.horizon_logits is None:
                 raise RuntimeError("Adaptive horizon policy is enabled but the actor did not return logits.")
             horizon_probs = self._horizon_probs_from_logits(policy_output.horizon_logits)
+            assert horizon_probs is not None
+        residual_l1_penalty, residual_l1 = self._residual_l1_actor_penalty(action_pred, horizon_probs)
+
+        if self.uses_adaptive_horizons:
             assert horizon_probs is not None
             critic_actions = self._build_critic_actions(obs, action_pred)
             q_by_horizon = self._evaluate_critic_actions(
@@ -1395,6 +1574,7 @@ class QAgent(nn.Module):
                 torch.argmax(horizon_probs, dim=-1), num_classes=self.num_adaptive_horizons
             ).to(action_pred.dtype)
             combined_action = self._build_critic_actions(obs, action_pred, horizon_onehot=greedy_horizon_onehot)
+            selected_residual = self._select_residual_candidate(action_pred, greedy_horizon_onehot)
             return (
                 actor_loss_total,
                 actor_loss_base,
@@ -1407,6 +1587,7 @@ class QAgent(nn.Module):
                     "horizon_entropy": entropy,
                     "residual_l1_penalty": residual_l1_penalty,
                     "actor_residual_l1": residual_l1,
+                    "selected_residual": selected_residual,
                 },
             )
 
@@ -1469,7 +1650,7 @@ class QAgent(nn.Module):
         if self.cfg.residual_l1_penalty_coef > 0:
             metrics["train/actor_residual_l1_penalty"] = actor_aux["residual_l1_penalty"].item()
         # Store residual actions for logging (the actual residual component we want to monitor)
-        metrics["_actions"] = action_pred.detach().cpu()
+        metrics["_actions"] = actor_aux.get("selected_residual", action_pred).detach().cpu()
         # Also store combined actions if needed for other purposes
         metrics["_combined_actions"] = combined_action.detach().cpu()
         if self.uses_adaptive_horizons:
@@ -1522,7 +1703,7 @@ class QAgent(nn.Module):
         if self.cfg.residual_l1_penalty_coef > 0:
             metrics["train/actor_residual_l1_penalty"] = actor_aux["residual_l1_penalty"].item()
         # Store residual actions for logging (the actual residual component we want to monitor)
-        metrics["_actions"] = action_pred.detach().cpu()
+        metrics["_actions"] = actor_aux.get("selected_residual", action_pred).detach().cpu()
         # Also store combined actions if needed for other purposes
         metrics["_combined_actions"] = combined_action.detach().cpu()
         if self.uses_adaptive_horizons:

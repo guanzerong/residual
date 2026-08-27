@@ -15,6 +15,8 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgo
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
     num_episodes: int | None = 300
+    cache_loader_batch_size: int = 1
+    cache_loader_num_workers: int = 0
     # Offline data action labeling options
     use_base_policy_for_base_actions: bool = True
     # Normalization safeguards
@@ -35,9 +37,29 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
+    provider: str = "wandb_act"
+    local_path: str | None = None
     wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
+    openpi_root: str = "/data_all/gzr1/openpi"
+    openpi_train_config: str | None = None
+    openpi_checkpoint_dir: str | None = None
+    openpi_default_prompt: str | None = None
+    openpi_token_pool_size: int = 4
+    openpi_base_image_key: str = "observation.images.agentview"
+    openpi_left_wrist_image_key: str = "observation.images.robot0_eye_in_hand"
+    openpi_right_wrist_image_key: str | None = None
+    openpi_remote_host: str = "127.0.0.1"
+    openpi_remote_port: int = 8765
+    groot_root: str = "/data_all/gzr1/code/Isaac-GR00T-n1.5"
+    groot_model_path: str = "nvidia/GR00T-N1.5-3B"
+    groot_default_prompt: str | None = None
+    groot_token_target_count: int = 32
+    groot_base_image_key: str = "observation.images.agentview"
+    groot_wrist_image_key: str = "observation.images.robot0_eye_in_hand"
+    groot_remote_host: str = "127.0.0.1"
+    groot_remote_port: int = 8775
 
 
 @dataclass
@@ -64,10 +86,23 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # Number of primitive actions corrected by a single residual action.
     # Keep this at 1 to preserve the original single-step residual TD3 behaviour.
     macro_action_horizon: int = 1
+    # Query one base-policy chunk, keep its proposal context fixed for this
+    # many primitive steps, and recompute a single-step residual from fresh
+    # RGB/proprioception at every step. Zero disables this execution mode.
+    fixed_proposal_horizon: int = 0
     adaptive_macro_enabled: bool = False
     adaptive_macro_horizons: tuple[int, ...] = (4, 5, 6)
+    # Residual generation used by adaptive macro actions. ``shared_prefix``
+    # emits one residual chunk and masks prefixes; ``horizon_conditioned``
+    # emits one candidate per horizon using a shared decoder plus duration
+    # embedding.
+    adaptive_residual_mode: str = "shared_prefix"
     adaptive_macro_offline_stride: int = 4
     adaptive_macro_horizon_entropy_reg: float = 0.0
+    # Optional method-independent update budget for controlled timing
+    # comparisons. Zero preserves the original updates-per-decision behavior.
+    updates_per_primitive_step: float = 0.0
+    actor_update_every_n_updates: int = 0
 
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
@@ -127,6 +162,9 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # Logging / checkpointing
     # ------------------------------------------------------------------
     eval_interval_every_steps: int = 10_000
+
+    # Run a larger evaluation once training is complete. Zero disables it.
+    eval_final_num_episodes: int = 0
 
     # Whether to run an evaluation pass before training begins (at step 0)
     eval_first: bool = True

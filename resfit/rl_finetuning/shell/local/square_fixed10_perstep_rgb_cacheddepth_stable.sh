@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT_DIR="/data_all/gzr1/code/residual-offpolicy-rl-macrocls-change-xiugai"
 DA2_ROOT="${ROOT_DIR}/third_party/Depth-Anything-V2"
 PYTHON_BIN="${PYTHON_BIN:-/home/gzr1/miniconda3/envs/residual/bin/python}"
+SEED="${SEED:-0}"
+WANDB_GROUP="${WANDB_GROUP:-square_fixed10_perstep_rgb_cacheddepth}"
+WANDB_NAME="${WANDB_NAME:-square_fixed10_perstep_rgb_cacheddepth_seed${SEED}}"
 EVAL_METRICS_DIR="${EVAL_METRICS_DIR:-/data_all/gzr1/experiment_results/square_reactive_vs_ahr}"
 export EVAL_METRICS_DIR
 
@@ -12,18 +15,20 @@ cd "${ROOT_DIR}"
 
 "${PYTHON_BIN}" -m resfit.rl_finetuning.scripts.train_residual_td3 \
     --config-name=residual_td3_square_config \
+    seed="${SEED}" \
     base_policy.local_path=/data_all/gzr1/.wandb/artifacts/run_i9tt1t4a_latest:v41/policy \
     base_policy.wandb_id=square-ph-bc/i9tt1t4a \
     base_policy.wt_type=latest \
     base_policy.wt_version=v41 \
     offline_data.name=ankile/robomimic-ph-square-image \
     offline_data.num_episodes=200 \
+    offline_data.cache_loader_batch_size=1 \
     offline_data.use_base_policy_for_base_actions=true \
-    algo.macro_action_horizon=10 \
-    algo.adaptive_macro_enabled=true \
-    algo.adaptive_macro_horizons=[4,7,10] \
-    algo.adaptive_macro_offline_stride=2 \
-    algo.adaptive_macro_horizon_entropy_reg=0.0 \
+    algo.macro_action_horizon=1 \
+    algo.fixed_proposal_horizon=10 \
+    algo.adaptive_macro_enabled=false \
+    algo.n_step=1 \
+    algo.update_every_n_steps=7 \
     algo.total_timesteps=1000000 \
     algo.prefetch_batches=4 \
     algo.gamma=0.996 \
@@ -52,7 +57,7 @@ cd "${ROOT_DIR}"
     eval_num_episodes=50 \
     eval_final_num_episodes=100 \
     wandb.project=robomimic-square-ph-residual-td3 \
-    wandb.name=square_macro4710_adaptive_resvit_localdepth_stable \
-    wandb.group=macro4710_adaptive_localdepth_stable \
+    wandb.name="${WANDB_NAME}" \
+    wandb.group="${WANDB_GROUP}" \
     wandb.mode=online \
     "$@"

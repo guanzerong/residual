@@ -158,6 +158,9 @@ class ActorConfig:
     num_layers: int = 2
     # Layer normalization control
     use_layer_norm: bool = True
+    # Embedding width used when residual candidates are conditioned on duration.
+    # The decoder weights remain shared across all candidate horizons.
+    duration_embedding_dim: int = 32
 
 
 @dataclass
@@ -177,6 +180,8 @@ class QAgentConfig:
     use_residual_image_encoder: bool = True
     # Reuse the frozen base ACT policy's transformer encoder tokens as residual state tokens.
     use_base_act_encoder_state: bool = False
+    # Generic alias for frozen base-policy encoder tokens (e.g. OpenPI adapters).
+    use_base_policy_encoder_state: bool = False
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
     depth_anything_v2_conditioning: DepthAnythingV2ConditioningConfig = field(
         default_factory=lambda: DepthAnythingV2ConditioningConfig()
